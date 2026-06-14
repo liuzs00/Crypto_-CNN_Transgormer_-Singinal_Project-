@@ -29,7 +29,13 @@ Advanced improvements over v2:
     LR warmup + cosine decay
 """
 
-import os, warnings
+import os, sys, warnings
+# Force UTF-8 stdout so the unicode bar chars in the attention report
+# don't crash on Windows' default GBK console encoding.
+try:
+    sys.stdout.reconfigure(encoding='utf-8')
+except Exception:
+    pass
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -761,6 +767,7 @@ p_long = tprobs[:, 1]
 # Use the ATR value at the last timestep of each test sequence to
 # classify the current regime, then tighten/loosen confidence gates.
 vol_idx = feat_cols.index(VOL_FEATURE) if VOL_FEATURE in feat_cols else None
+p33 = p67 = None   # populated below; saved in checkpoint so btc_predict.py uses the same split
 if vol_idx is not None:
     vol_tr   = Xtr_s[:, -1, vol_idx]                        # training ATR (scaled)
     p33, p67 = np.percentile(vol_tr, [33, 67])              # regime boundaries
@@ -831,6 +838,8 @@ torch.save({
     'feat_cols':   feat_cols,
     'seq_len':     SEQ_LEN,
     'history':     hist,
+    'vol_p33':     float(p33) if p33 is not None else None,
+    'vol_p67':     float(p67) if p67 is not None else None,
 }, ckpt)
 print(f"\nCheckpoint → {ckpt}")
 

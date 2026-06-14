@@ -172,7 +172,9 @@ class TransformerBlock(nn.Module):
             nn.Linear(d_ff, d_model), nn.Dropout(dropout),
         )
     def forward(self, x):
-        return x + self.ff(self.n2(x + self.attn(self.n1(x))))
+        x = x + self.attn(self.n1(x))   # residual 1 (pre-norm attention)
+        x = x + self.ff(self.n2(x))     # residual 2 (pre-norm feed-forward)
+        return x
 
 
 class TemporalTransformer(nn.Module):
@@ -322,6 +324,8 @@ def main():
     scaler    = ckpt['scaler']
     feat_cols = ckpt['feat_cols']
     seq_len   = ckpt['seq_len']
+    vol_p33   = ckpt.get('vol_p33', None)
+    vol_p67   = ckpt.get('vol_p67', None)
     print(f"  seq_len={seq_len}  n_feat={model_cfg['n_feat']}  "
           f"d_model={model_cfg['d_model']}  layers={model_cfg['n_layers']}")
 
@@ -378,10 +382,16 @@ def main():
     X_scaled_all   = np.clip(scaler.transform(X_all), -6, 6).astype(np.float32)
     print(f"  Feature matrix: {X_all.shape}")
 
-    # ── ATR percentiles from full history (for adaptive thresholding) ──
+    # ── ATR regime boundaries ─────────────────────────────────────
+    # Prefer the training-set boundaries saved in the checkpoint so the
+    # regime split matches btc_lstm_train.py exactly. Fall back to
+    # full-history percentiles for older checkpoints without them.
     vol_idx = feat_cols.index(VOL_FEATURE) if VOL_FEATURE in feat_cols else None
     if vol_idx is not None:
-        p33, p67 = np.percentile(X_scaled_all[:, vol_idx], [33, 67])
+        if vol_p33 is not None and vol_p67 is not None:
+            p33, p67 = vol_p33, vol_p67
+        else:
+            p33, p67 = np.percentile(X_scaled_all[:, vol_idx], [33, 67])
 
     # ── Resolve window indices ─────────────────────────────────────
     ts_series = pd.Series(pd.to_datetime(timestamps_all))   # tz-naive UTC from .values

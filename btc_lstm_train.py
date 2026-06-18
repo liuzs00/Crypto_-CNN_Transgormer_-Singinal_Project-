@@ -58,10 +58,16 @@ DATA_DIR     = r"D:\Document\LLLLLLLLLLLLL\DATA"
 SAVE_DIR     = r"D:\Document\LLLLLLLLLLLLL"
 SEQ_LEN      = 64
 PATCH_SIZE   = 4        # 64 steps → 16 patch tokens
-# Triple-Barrier Label parameters (Lopez de Prado)
-TP_PCT       = 0.015   # take-profit barrier: 
-SL_PCT       = 0.03    # stop-loss barrier:   
-TB_TIMEOUT   = 4      # vertical barrier:     
+# Triple-Barrier Label parameters (Lopez de Prado) — independent per direction.
+# A candle is labelled Long only if a LONG trade would have won, Short only if a
+# SHORT trade would have won (each evaluated against its OWN TP/SL). All values
+# are positive magnitudes of price movement from the entry close.
+# Defaults reproduce the original single-pair scheme (up 1.5% / down 3%).
+LONG_TP      = 0.03   # long  take-profit: price RISES this much  → long wins
+LONG_SL      = 0.015    # long  stop-loss:   price FALLS this much  → long loses
+SHORT_TP     = 0.03    # short take-profit: price FALLS this much  → short wins
+SHORT_SL     = 0.015   # short stop-loss:   price RISES this much  → short loses
+TB_TIMEOUT   = 4      # vertical (time) barrier: max look-forward candles
 BATCH        = 64
 EPOCHS       = 100
 LR_MAX       = 1e-3
@@ -333,41 +339,59 @@ print(f"Merged shape: {base.shape}")
 # ─────────────────────────────────────────────
 # 4. LABELS  — Triple-Barrier Method (Lopez de Prado)
 # ─────────────────────────────────────────────
-# For each candle t, scan forward up to TB_TIMEOUT candles.
-# Use each future candle's High/Low so intracandle barrier touches are captured.
+# For each candle t, scan forward up to TB_TIMEOUT candles, capturing intracandle
+# barrier touches via each future candle's High/Low. Each trade direction is
+# resolved against its OWN take-profit / stop-loss:
 #
-#   High[t+k] >= TP  →  label 1  (Long:  TP hit first)
-#   Low[t+k]  <= SL  →  label 0  (Short: SL hit first)
-#   Both in same candle → ambiguous → NaN (dropped)
-#   Timeout reached without either → NaN (dropped)
+#   LONG wins   : High hits +LONG_TP   before Low hits  -LONG_SL
+#   SHORT wins  : Low  hits -SHORT_TP  before High hits +SHORT_SL
 #
-# Asymmetric barriers (TP 1.0% > SL 0.7%) encode a positive risk/reward target.
+# Label assignment (single class per candle):
+#   long wins & short loses/unresolved  →  label 1  (Long)
+#   short wins & long loses/unresolved  →  label 0  (Short)
+#   both win, both lose, or unresolved  →  NaN (dropped from the loss)
+#
+# Resolving each side independently lets you encode different risk/reward for
+# longs and shorts, and keeps the labels consistent with btc_backtest.py.
 
-def triple_barrier(close_arr, high_arr, low_arr, tp_pct, sl_pct, timeout):
+def triple_barrier(close_arr, high_arr, low_arr,
+                   long_tp, long_sl, short_tp, short_sl, timeout):
     n      = len(close_arr)
     labels = np.full(n, np.nan)
     for i in range(n - 1):
-        ref    = close_arr[i]
-        tp_lvl = ref * (1 + tp_pct)
-        sl_lvl = ref * (1 - sl_pct)
+        ref          = close_arr[i]
+        long_tp_lvl  = ref * (1 + long_tp)    # up   — long take-profit
+        long_sl_lvl  = ref * (1 - long_sl)    # down — long stop-loss
+        short_tp_lvl = ref * (1 - short_tp)   # down — short take-profit
+        short_sl_lvl = ref * (1 + short_sl)   # up   — short stop-loss
+
+        long_win = None    # None = unresolved, True = won, False = lost
+        short_win = None
         for j in range(i + 1, min(i + 1 + timeout, n)):
-            tp_hit = high_arr[j] >= tp_lvl
-            sl_hit = low_arr[j]  <= sl_lvl
-            if tp_hit and sl_hit:
-                break               # both barriers in same candle — ambiguous
-            elif tp_hit:
-                labels[i] = 1
+            hi, lo = high_arr[j], low_arr[j]
+            if long_win is None:                         # resolve LONG side
+                up_hit, dn_hit = hi >= long_tp_lvl, lo <= long_sl_lvl
+                if up_hit and dn_hit: long_win = False   # ambiguous → treat as loss
+                elif up_hit:          long_win = True
+                elif dn_hit:          long_win = False
+            if short_win is None:                        # resolve SHORT side
+                dn_hit, up_hit = lo <= short_tp_lvl, hi >= short_sl_lvl
+                if dn_hit and up_hit: short_win = False
+                elif dn_hit:          short_win = True
+                elif up_hit:          short_win = False
+            if long_win is not None and short_win is not None:
                 break
-            elif sl_hit:
-                labels[i] = 0
-                break
-        # if loop ends without break → timeout → NaN
+
+        lw, sw = (long_win is True), (short_win is True)
+        if   lw and not sw: labels[i] = 1
+        elif sw and not lw: labels[i] = 0
+        # both / neither → NaN (timeout-unresolved also lands here)
     return labels
 
 print("Computing triple-barrier labels …")
 base['label'] = triple_barrier(
     base['Close'].values, base['High'].values, base['Low'].values,
-    TP_PCT, SL_PCT, TB_TIMEOUT
+    LONG_TP, LONG_SL, SHORT_TP, SHORT_SL, TB_TIMEOUT
 )
 # Report label stats (before dropping timeout rows)
 _lbl_valid = base['label'].dropna()

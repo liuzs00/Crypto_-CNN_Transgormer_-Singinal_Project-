@@ -4,7 +4,7 @@ Model: `btc_eth_sol_pooled_model_emb_cross_nf.pth` · Trainer: `btc_eth_sol_cros
 **282 features** per candle, all **scale-invariant** (ratios / returns / z-scores) and
 strictly **causal** (no look-ahead).
 
-## Structure (how 274 is composed)
+## Structure (how 282 is composed)
 
 | Block | Count | Source |
 |---|---:|---|

@@ -97,6 +97,14 @@ def add_indicators(df, px=''):
     gw=pd.DataFrame({'pv':pv.values,'v':v.values,'k':wk}); avw=(gw.groupby('k')['pv'].cumsum()/(gw.groupby('k')['v'].cumsum()+1e-9)).values
     gm=pd.DataFrame({'pv':pv.values,'v':v.values,'k':mo}); avm=(gm.groupby('k')['pv'].cumsum()/(gm.groupby('k')['v'].cumsum()+1e-9)).values
     d[f'{px}vwap_dist_w']=(c.values-avw)/(atr14.values+1e-9); d[f'{px}vwap_dist_m']=(c.values-avm)/(atr14.values+1e-9)
+    # Path entropy: permutation entropy (Bandt-Pompe, order d=3) on LOG-PRICE — must match trainer
+    _x=np.log(c.clip(lower=1e-9)).values; _a=np.roll(_x,2); _b=np.roll(_x,1)
+    code=((_a<_b).astype(np.int64)*4+(_a<_x).astype(np.int64)*2+(_b<_x).astype(np.int64)); code[:2]=-1
+    oh=np.zeros((len(_x),8)); ok=code>=0; oh[np.arange(len(_x))[ok],code[ok]]=1.0
+    cnt=pd.DataFrame(oh).rolling(50).sum().values; pp=cnt/(cnt.sum(1,keepdims=True)+1e-9)
+    with np.errstate(divide='ignore',invalid='ignore'):
+        ent=-(np.where(pp>0,pp*np.log(pp),0.0)).sum(1)/np.log(6)
+    d[f'{px}pent']=ent; d[f'{px}pent_chg']=pd.Series(ent,index=d.index)-pd.Series(ent,index=d.index).shift(6)
     return d
 
 def triple_barrier(c,h,l,ltp,lsl,stp,ssl,T):

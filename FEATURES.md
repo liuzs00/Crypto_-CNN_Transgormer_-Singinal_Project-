@@ -1,17 +1,17 @@
 # Feature Dictionary — Newest Model (`emb_cross_nf`)
 
 Model: `btc_eth_sol_pooled_model_emb_cross_nf.pth` · Trainer: `btc_eth_sol_cross_train.py`
-**274 features** per candle, all **scale-invariant** (ratios / returns / z-scores) and
+**282 features** per candle, all **scale-invariant** (ratios / returns / z-scores) and
 strictly **causal** (no look-ahead).
 
 ## Structure (how 274 is composed)
 
 | Block | Count | Source |
 |---|---:|---|
-| Per-timeframe indicators × 4 timeframes (15m, 1h, 4h, 1d) | ~65 × 4 = 260 | `add_indicators()` |
+| Per-timeframe indicators × 4 timeframes (15m, 1h, 4h, 1d) | ~67 × 4 = 268 | `add_indicators()` |
 | Cross-timeframe divergence | 4 | base merge |
 | Cross-asset (BTC vs ETH/SOL) + systemic | 10 | `add_cross_asset()` + `add_absorption()` |
-| **Total** | **274** | |
+| **Total** | **282** | |
 
 Each per-timeframe feature below exists **four times**, prefixed `15m_ 1h_ 4h_ 1d_`
 (e.g. `4h_rsi14`, `1d_rsi14`). The regime/threshold logic keys off `4h_atr14`.
@@ -119,6 +119,24 @@ to structural events. Restores the "where is price" information that pure ratios
 
 > aVWAP = cumulative Σ(typical_price·volume) / Σvolume, reset at each week/month open.
 
+## 9b. Path Entropy (Permutation Entropy) — **new feature**
+
+Complexity of the *price path*, not its magnitude. Realized volatility says how *big* the moves
+are; permutation entropy says how *ordered* they are — a smooth parabolic trend and a violent
+chopping range can share the same RV but have opposite entropy. This lets the attention layer
+lean on momentum features when the tape is structured and discount them when it is chaotic.
+
+| Feature | Formula | Meaning |
+|---|---|---|
+| `pent` | normalized Bandt-Pompe permutation entropy (order d=3) over the last 50 log-prices ∈ [0,1] | 0 = perfectly ordered / trending (momentum reliable); ≈1 = random-walk chop (favour reversion) |
+| `pent_chg` | `pent` − `pent`.shift(6) | entropy momentum — regime shifting between structured ↔ chaotic |
+
+> Computed on **log-price** (returns are ~IID, so their *ordering* is near-random regardless of
+> regime — entropy on returns barely discriminates), over a **trailing** 50-bar window (leak-free).
+> Used in place of Sample/Approximate Entropy, which are O(W²)/bar and infeasible across the
+> 300k-row 15m series; permutation entropy is the fast, noise-robust, fully vectorizable cousin
+> that measures the same path-predictability.
+
 ---
 
 ## 10. Cross-Timeframe Divergence
@@ -172,3 +190,8 @@ return covariance.
 - **The two newest features** (`vwap_dist_*`, `x_absorb*`) gave the project's largest single
   accuracy jump — but only on the multi-asset model with enough data to learn them; they
   overfit the smaller BTC-only baseline.
+- **Path entropy** (`pent`, `pent_chg`) is the most recent addition. It cleared a **3-seed
+  paired A/B** — active-signal accuracy improved in 3 of 3 seeds (~+1.3pp mean) with val-loss
+  better on average — unlike several rejected ideas (Hawkes self-excitation, wavelet detail
+  coefficients) that did not replicate across seeds. Modest but robust, and **orthogonal**: it
+  encodes path *predictability*, which the EMA cascade and realized-vol features do not.

@@ -38,6 +38,14 @@ from torch.utils.data import Dataset, DataLoader
 
 warnings.filterwarnings('ignore')
 
+# Optional reproducibility: set SEED to make weight-init, shuffling and dropout identical
+# across runs → a clean PAIRED A/B (only the feature set differs). Off by default (no SEED).
+_SEED = os.environ.get('SEED')
+if _SEED is not None:
+    import random as _random
+    _random.seed(int(_SEED)); np.random.seed(int(_SEED)); torch.manual_seed(int(_SEED))
+    if torch.cuda.is_available(): torch.cuda.manual_seed_all(int(_SEED))
+
 DATA_DIR     = r"D:\Document\LLLLLLLLLLLLL\DATA"
 SAVE_DIR     = r"D:\Document\LLLLLLLLLLLLL"
 SEQ_LEN      = 64
@@ -54,8 +62,14 @@ BTC_ONLY      = os.environ.get('BTC_ONLY','0') == '1'  # train on BTC rows only 
 USE_ASSET_EMB = (os.environ.get('ASSET_EMB','1') == '1') and not BTC_ONLY
 USE_CROSS     = os.environ.get('CROSS','1') == '1'   # Approach C: crypto cross-asset features
 USE_NEWFEAT   = os.environ.get('NEWFEAT','0') == '1' # Anchored-VWAP + Absorption-Ratio
+USE_HAWKES    = os.environ.get('HAWKES','0') == '1'  # Hawkes self-excitation (branching ratio)
+HAWKES_W      = 20    # rolling window for the moment-based branching-ratio estimator
+USE_DWT       = os.environ.get('DWT','0') == '1'     # causal à-trous wavelet detail coefficients
+USE_ENTROPY   = os.environ.get('ENTROPY','0') == '1' # permutation-entropy path-complexity regime
+ENT_W         = 50    # rolling window for permutation entropy
 TAG = ('btconly' if BTC_ONLY else ('emb' if USE_ASSET_EMB else 'noemb')) + \
-      ('_cross' if USE_CROSS else '') + ('_nf' if USE_NEWFEAT else '')
+      ('_cross' if USE_CROSS else '') + ('_nf' if USE_NEWFEAT else '') + \
+      ('_hwk' if USE_HAWKES else '') + ('_dwt' if USE_DWT else '') + ('_ent' if USE_ENTROPY else '')
 ABS_WINDOW = 60   # rolling window for the PCA absorption ratio
 
 ASSETS = {
@@ -106,6 +120,14 @@ def add_indicators(df, px=''):
     if 'n_trades' in d.columns:
         nt=d['n_trades']; d[f'{px}trade_int']=nt/(nt.rolling(20).mean()+1e-9)
         avg_t=v/(nt+1e-9); d[f'{px}trade_size']=avg_t/(avg_t.rolling(20).mean()+1e-9)
+        if USE_HAWKES:
+            # Hawkes self-excitation proxy: branching ratio η from the trade-count
+            # Fano factor (Var/Mean → 1/(1-η)²  ⇒  η ≈ 1 − √(Mean/Var)). η∈[0,1):
+            # high = bursty/algorithmic clustering (iceberg execution); spikes lead sweeps.
+            ntm=nt.rolling(HAWKES_W).mean(); ntv=nt.rolling(HAWKES_W).var()
+            eta=(1-np.sqrt((ntm/(ntv+1e-9)).clip(lower=0))).clip(lower=0,upper=0.99)
+            d[f'{px}hawkes_eta']=eta
+            d[f'{px}hawkes_eta_mom']=eta-eta.shift(6)   # excitation spike (α-spike detector)
     vol_sync=(h-l)/(v+1e-9); d[f'{px}vol_sync']=vol_sync/(vol_sync.rolling(20).mean()+1e-9)
     rv=(ret1**2).rolling(20).sum(); rbv=(ret1.abs()*ret1.shift(1).abs()).rolling(20).sum()*(np.pi/2)
     d[f'{px}jump_ratio']=rv/(rbv+1e-9)
@@ -146,6 +168,40 @@ def add_indicators(df, px=''):
     d[f'{px}skew10']=ret1.rolling(10).skew(); d[f'{px}autocorr']=ret1.rolling(20).corr(ret1.shift(1))
     d[f'{px}body']=(c-o)/(atr14+1e-9); d[f'{px}hl']=(h-l)/(c+1e-9)
     d[f'{px}upper']=(h-c.clip(lower=o))/(atr14+1e-9); d[f'{px}lower']=(c.clip(upper=o)-l)/(atr14+1e-9)
+    # ── Discrete-wavelet detail coefficients (causal à-trous / Haar) ──
+    # Multi-resolution band-pass of log-price. Each scale S_j is a *trailing* smoothing,
+    # so detail D_j(t)=S_{j-1}-S_j(t) uses only bars <= t (leak-free, unlike the decimated
+    # pywt DWT whose boundary coeffs touch future samples). On log-price the coeffs are in
+    # return units → scale-invariant & pool-safe. D_j isolates a frequency band, so it tracks
+    # a micro-cycle with less lag than any single arbitrary EMA of the same span.
+    if USE_DWT:
+        lc=np.log(c.clip(lower=1e-9))
+        s1=lc.rolling(2).mean(); s2=lc.rolling(4).mean(); s3=lc.rolling(8).mean()
+        d2=s1-s2; d3=s2-s3                                    # level-2 / level-3 detail coeffs
+        d[f'{px}dwt_d2']=d2; d[f'{px}dwt_d3']=d3
+        d[f'{px}dwt_d2_e']=np.sqrt((d2**2).rolling(6).mean())   # level-2 cyclical energy
+        d[f'{px}dwt_d3_e']=np.sqrt((d3**2).rolling(12).mean())  # level-3 cyclical energy
+    # ── Path entropy: permutation entropy (Bandt-Pompe, order d=3) ──
+    # Disorder in the *ordering* of recent returns, not their magnitude (vs RV/atr).
+    # Low ⇒ structured/trending (momentum reliable); high≈1 ⇒ random-walk chop (favour
+    # reversion). Vectorized & leak-free (trailing window of past returns only). Used in
+    # place of SampEn/ApEn, which are O(W²)/bar and infeasible on the 300k-row 15m series.
+    if USE_NEWFEAT or USE_ENTROPY:   # adopted into the production feature set (282 feat)
+        # PE on LOG-PRICE (not returns): returns are ~IID so their ordering is always near-
+        # random (PE≈1 regardless); the price level within the window is what separates a
+        # smooth trend (ordered triples → low PE) from chop (mixed triples → high PE).
+        _x=np.log(c.clip(lower=1e-9)).values; _a=np.roll(_x,2); _b=np.roll(_x,1)
+        # ordinal code of each (x[t-2],x[t-1],x[t]) triple via pairwise comparisons → ≤6 patterns
+        code=((_a<_b).astype(np.int64)*4+(_a<_x).astype(np.int64)*2+(_b<_x).astype(np.int64))
+        code[:2]=-1                                            # first two triples undefined
+        oh=np.zeros((len(_x),8)); ok=code>=0
+        oh[np.arange(len(_x))[ok], code[ok]]=1.0
+        cnt=pd.DataFrame(oh).rolling(ENT_W).sum().values       # rolling pattern histogram
+        pp=cnt/(cnt.sum(1,keepdims=True)+1e-9)
+        with np.errstate(divide='ignore',invalid='ignore'):
+            ent=-(np.where(pp>0, pp*np.log(pp), 0.0)).sum(1)/np.log(6)   # normalized PE ∈ [0,1]
+        d[f'{px}pent']=ent
+        d[f'{px}pent_chg']=pd.Series(ent,index=d.index)-pd.Series(ent,index=d.index).shift(6)
     # ── Anchored-VWAP distance (z-score vs institutional cost basis) ──
     if USE_NEWFEAT and 'timestamp' in d.columns:
         ts = pd.to_datetime(d['timestamp']); iso = ts.dt.isocalendar()

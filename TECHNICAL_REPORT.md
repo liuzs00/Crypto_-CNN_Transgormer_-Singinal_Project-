@@ -2,8 +2,12 @@
 
 **Scope.** This report documents (1) the network architecture, (2) the feature-construction
 pipeline, and (3) the training, labelling, calibration, and evaluation techniques used in the
-BTC long/short signal engine. All notation matches the implementation in
-`btc_lstm_train.py` and `btc_predict.py`.
+BTC long/short signal engine. Sections **1–8** describe the core single-asset engine
+(`btc_lstm_train.py` / `btc_predict.py`, 256 features). Section **9** documents the
+**production multi-asset model** `emb_cross_nf` (`btc_eth_sol_cross_train.py`,
+`btc_backtest_cross_nf.py`, 282 features) — how it extends the core with multi-asset pooling,
+additional feature families, per-direction barriers, and a temporal-conv tokenizer, all
+adopted under a seed-controlled empirical protocol.
 
 ---
 
@@ -246,18 +250,89 @@ This is why the minority Short class can be tradeable despite lower absolute pre
 
 ---
 
-## 9. Techniques Checklist (for quick reference)
+## 9. Production Model — `emb_cross_nf` (multi-asset extensions)
 
-**Architecture:** Temporal Transformer · Squeeze-and-Excitation · patch tokenisation ·
-RoPE · ALiBi · pre-LayerNorm residuals · mean-pool classification head.
+The production model keeps the §4 transformer core but extends the engine along four axes.
+Every change below was adopted **only after** the seed-controlled empirical protocol in §9.5.
+
+### 9.1 Multi-asset pooling + asset embedding
+- Training rows are **pooled across BTC + ETH + SOL** (the scale-invariant features make this
+  valid); validation and test remain **BTC-only**.
+- **Leakage discipline:** the train/val boundaries are taken from BTC's labelled timeline at the
+  same 70/85 fractions, and every ETH/SOL row from the val/test era is dropped — so the BTC test
+  candles are *identical* to the single-asset engine, keeping results comparable.
+- **Asset embedding:** a learnable per-asset bias added to the pooled vector before the head, so
+  shared layers learn universal structure while the embedding absorbs per-asset idiosyncrasy
+  (BTC inference uses `asset_id = 0`).
+
+### 9.2 Feature extensions (256 → 282)
+Beyond the §3 per-timeframe set (full dictionary in `FEATURES.md`):
+- **Cross-asset (leave-one-out):** each asset vs the mean of the *others* — relative
+  return/vol/RSI, β, correlation, cross-sectional rank. Symmetric, so a column means the same
+  thing for every asset (preserves pooling validity).
+- **Systemic fragility — Absorption Ratio:** `λ₁/Σλ` of a rolling 60-bar PCA over the
+  BTC/ETH/SOL return covariance; high ⇒ assets in lockstep (macro-driven, fragile).
+- **Anchored VWAP distance:** `(Close − weekly/monthly-anchored VWAP)/ATR` — a stationary view
+  of price vs the institutional cost basis.
+- **Path entropy (permutation entropy):** normalised Bandt-Pompe entropy (order *d* = 3) of the
+  trailing 50 **log-prices** — disorder of the price *path*: low ⇒ trending (momentum reliable),
+  high ≈ 1 ⇒ chop (favour reversion). On log-price (returns are ~IID so their ordering is
+  near-random), leak-free; the fast, vectorizable cousin of Sample/Approximate Entropy.
+
+### 9.3 Per-direction triple barriers
+The label is resolved against **independent long and short barriers** (`LONG_TP/LONG_SL` and
+`SHORT_TP/SHORT_SL`, each 3% / 1.5% → 2:1 reward:risk per side): `label = 1` only if the long
+side wins, `0` only if the short side wins, `NaN` otherwise — a cleaner directional separation
+than the single asymmetric barrier of §2.2.
+
+### 9.4 Temporal conv-stem tokenizer
+The §4.2 linear patch embedding is replaced by a **temporal CNN stem** (`ConvStem`): two
+`Conv1d(k=3)` layers whose **overlapping** receptive field captures local candle motifs *across*
+patch boundaries (a non-overlapping linear patch cannot), then a strided `Conv1d(k=4, s=4)`
+downsamples 64 → 16 tokens; the transformer core (§4.3) is unchanged. Saved as
+`model_cfg['use_convstem']`; `CONVSTEM=0` is the linear-patch ablation. ≈ **2.33M** params.
+The conv stem is a better *inductive bias* (locality + translation-equivariance match how candle
+motifs behave), which is why validation loss **improved** despite the extra parameters.
+
+### 9.5 Empirical adoption protocol
+Each proposed change is run as a **seed-paired A/B** (an opt-in `SEED` fixes weight-init,
+shuffling and dropout so only the change differs) and judged on **active-signal accuracy across
+≥ 3 seeds**, with a **coverage check** (an accuracy gain from simply trading fewer bars is
+conservatism, not quality). Architecture changes additionally require a **multi-seed backtest**
+confirmation, trusting **profit factor / per-trade expectancy / Calmar** (robust, averaged over
+thousands of trades) over total return (compounded and path-dependent).
+
+| Idea | Type | Verdict |
+|---|---|---|
+| Path entropy | feature | **adopted** — +1.3pp active acc, 3/3 seeds |
+| Temporal conv stem | architecture | **adopted** — +2.66pp acc 3/3; PF 5/5, Calmar +60% in backtest |
+| Wavelet (DWT) detail coeffs | feature | rejected — won only 1/3 seeds (EMA-redundant) |
+| Hawkes self-excitation | feature | rejected — within noise |
+| Fractional differencing | feature | rejected — level-memory clashes with pooled scale-invariance |
+| Gated attention pooling | architecture | rejected — single-seed backtest win failed multi-seed confirmation |
+
+**Recurring lesson:** data (multi-asset) and orthogonal features move the needle; *heavy*
+architecture changes do not — except a *minimal* tokenizer upgrade that preserves the working
+transformer.
+
+---
+
+## 10. Techniques Checklist (for quick reference)
+
+**Architecture:** Temporal Transformer · Squeeze-and-Excitation · patch tokenisation /
+**temporal conv-stem** (production) · **learnable asset embedding** · RoPE · ALiBi ·
+pre-LayerNorm residuals · mean-pool classification head.
 
 **Learning:** focal loss · label smoothing · inverse-frequency class weighting · AdamW ·
 warmup + cosine LR · gradient clipping · early stopping · jitter & feature-mask augmentation.
 
-**Finance / data:** triple-barrier labelling · asymmetric risk/reward barriers · ATR / Wilder
+**Finance / data:** triple-barrier labelling · asymmetric & **per-direction** risk/reward
+barriers · **multi-asset pooling (BTC/ETH/SOL)** · **cross-asset leave-one-out** features ·
+**PCA absorption ratio** · **anchored VWAP** · **permutation (path) entropy** · ATR / Wilder
 EMA · order-flow imbalance · VPIN · Amihud illiquidity · realised bipower variation (jump
 detection) · Ichimoku · multi-timeframe fusion via merge-asof · scale-invariant feature design.
 
 **Validation / serving:** chronological split · leakage-safe windowing · RobustScaler fit on
-train only · volatility-regime-adaptive thresholds · expected-PnL calibration · attention-map
-interpretability · deterministic train/serve parity.
+train only · volatility-regime-adaptive thresholds · expected-PnL calibration ·
+**seed-paired feature/architecture A/B** · **multi-seed backtest confirmation (profit factor /
+Calmar)** · attention-map interpretability · deterministic train/serve parity.

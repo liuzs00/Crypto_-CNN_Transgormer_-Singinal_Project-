@@ -67,9 +67,11 @@ HAWKES_W      = 20    # rolling window for the moment-based branching-ratio esti
 USE_DWT       = os.environ.get('DWT','0') == '1'     # causal à-trous wavelet detail coefficients
 USE_ENTROPY   = os.environ.get('ENTROPY','0') == '1' # permutation-entropy path-complexity regime
 ENT_W         = 50    # rolling window for permutation entropy
+USE_CONVSTEM  = os.environ.get('CONVSTEM','1') == '1'  # temporal CNN stem (ADOPTED default); CONVSTEM=0 → linear-patch ablation
 TAG = ('btconly' if BTC_ONLY else ('emb' if USE_ASSET_EMB else 'noemb')) + \
       ('_cross' if USE_CROSS else '') + ('_nf' if USE_NEWFEAT else '') + \
-      ('_hwk' if USE_HAWKES else '') + ('_dwt' if USE_DWT else '') + ('_ent' if USE_ENTROPY else '')
+      ('_hwk' if USE_HAWKES else '') + ('_dwt' if USE_DWT else '') + ('_ent' if USE_ENTROPY else '') + \
+      ('' if USE_CONVSTEM else '_linpatch')
 ABS_WINDOW = 60   # rolling window for the PCA absorption ratio
 
 ASSETS = {
@@ -424,6 +426,23 @@ class PatchEmbed(nn.Module):
         B,T,Fd=x.shape; pad=(self.p-T%self.p)%self.p
         if pad: x=F.pad(x,(0,0,0,pad))
         return self.norm(self.proj(x.reshape(B,-1,self.p*Fd)))
+class ConvStem(nn.Module):
+    """Temporal CNN stem: overlapping convs capture local candle motifs ACROSS patch
+    boundaries (which the linear patch can't), then a strided conv downsamples T→T/patch
+    tokens. Drop-in replacement for PatchEmbed; transformer handles the global deps after."""
+    def __init__(self,n_feat,patch=PATCH_SIZE,d=D_MODEL):
+        super().__init__(); self.p=patch
+        self.conv1=nn.Conv1d(n_feat,d,kernel_size=3,padding=1)      # local motifs, full temporal res
+        self.conv2=nn.Conv1d(d,d,kernel_size=3,padding=1)           # deeper local (receptive field ~5)
+        self.down =nn.Conv1d(d,d,kernel_size=patch,stride=patch)    # → T/patch tokens
+        self.act=nn.GELU(); self.norm=nn.LayerNorm(d)
+    def forward(self,x):
+        B,T,Fd=x.shape; pad=(self.p-T%self.p)%self.p
+        if pad: x=F.pad(x,(0,0,0,pad))
+        x=x.transpose(1,2)                                          # (B,F,T)
+        x=self.act(self.conv1(x)); x=self.act(self.conv2(x))        # (B,d,T)
+        x=self.down(x).transpose(1,2)                               # (B,T/patch,d)
+        return self.norm(x)
 class RoPEEmbedding(nn.Module):
     def __init__(self,dim,base=10000):
         super().__init__(); inv=1.0/(base**(torch.arange(0,dim,2).float()/dim)); self.register_buffer('inv_freq',inv)
@@ -462,7 +481,8 @@ class TransformerBlock(nn.Module):
         x=x+self.attn(self.n1(x)); x=x+self.ff(self.n2(x)); return x
 class TemporalTransformer(nn.Module):
     def __init__(self,n_feat,n_assets=N_ASSETS,use_emb=USE_ASSET_EMB):
-        super().__init__(); self.se=SqueezeExcite(n_feat); self.embed=PatchEmbed(n_feat)
+        super().__init__(); self.se=SqueezeExcite(n_feat)
+        self.embed=ConvStem(n_feat) if USE_CONVSTEM else PatchEmbed(n_feat)
         self.blocks=nn.ModuleList([TransformerBlock() for _ in range(N_LAYERS)])
         self.use_emb=use_emb
         if use_emb: self.asset_emb=nn.Embedding(n_assets, D_MODEL)
@@ -558,7 +578,7 @@ print(f"\nProb(Long) — mean:{p_long.mean():.3f}  std:{p_long.std():.3f}  min:{
 ckpt=os.path.join(SAVE_DIR,f'btc_eth_sol_pooled_model_{TAG}.pth')
 torch.save({'model_state':best_state,
             'model_cfg':dict(n_feat=n_feat,d_model=D_MODEL,n_heads=N_HEADS,n_layers=N_LAYERS,d_ff=D_FF,drop=DROPOUT,
-                             patch_size=PATCH_SIZE,n_assets=N_ASSETS,use_emb=USE_ASSET_EMB),
+                             patch_size=PATCH_SIZE,n_assets=N_ASSETS,use_emb=USE_ASSET_EMB,use_convstem=USE_CONVSTEM),
             'scaler':scaler,'feat_cols':feat_cols,'seq_len':SEQ_LEN,'history':hist,
             'vol_p33':float(p33),'vol_p67':float(p67)}, ckpt)
 print(f"\nCheckpoint → {ckpt}")

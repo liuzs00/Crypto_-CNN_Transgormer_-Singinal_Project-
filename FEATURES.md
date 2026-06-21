@@ -195,3 +195,20 @@ return covariance.
   better on average — unlike several rejected ideas (Hawkes self-excitation, wavelet detail
   coefficients) that did not replicate across seeds. Modest but robust, and **orthogonal**: it
   encodes path *predictability*, which the EMA cascade and realized-vol features do not.
+
+## Architecture Note — Temporal Conv Stem (tokenizer)
+
+The production model replaces the linear **patch embedding** with a **temporal CNN stem**
+(`ConvStem`): two `Conv1d(k=3)` layers (overlapping receptive field → local candle motifs
+*across* patch boundaries, which a non-overlapping linear patch cannot see) + a strided conv
+that downsamples 64 steps → 16 tokens. The transformer then handles global dependencies as
+before. Saved in the checkpoint as `model_cfg['use_convstem']`; the linear-patch baseline is
+kept as the `CONVSTEM=0` ablation.
+
+This is the **first architecture change** in the project to beat the data/feature levers. It
+cleared a **3-seed accuracy A/B** (+2.66pp active accuracy, the largest of any single change;
+val-loss improved despite +0.4M params → generalizing, not overfitting) **and** a **5-seed
+backtest** confirmation: profit factor 5/5 seeds higher (1.98 vs 1.83), Calmar +60%
+(24.0 vs 14.9), drawdown 4/5 lower; the total-return gap was shown to be inside seed noise
+(0.42× the seed std). Likely works where the earlier ModernTCN hybrid failed because it is a
+*minimal* tokenizer upgrade that preserves the entire working transformer.

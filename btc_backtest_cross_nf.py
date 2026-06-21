@@ -24,7 +24,7 @@ import btc_predict as P           # THRESH_*, VOL_FEATURE
 
 DATA_DIR  = r"D:\Document\LLLLLLLLLLLLL\DATA"
 SAVE_DIR  = r"D:\Document\LLLLLLLLLLLLL"
-CKPT_PATH = os.path.join(SAVE_DIR, 'btc_eth_sol_pooled_model_emb_cross_nf.pth')
+CKPT_PATH = os.environ.get('CKPT', os.path.join(SAVE_DIR, 'btc_eth_sol_pooled_model_emb_cross_nf.pth'))
 SEQ_LEN   = 64; PATCH_SIZE = 4; ABS_WINDOW = 60
 LONG_TP, LONG_SL, SHORT_TP, SHORT_SL, TB_TIMEOUT = 0.03, 0.015, 0.03, 0.015, 4
 TRAIN_FRAC, VAL_FRAC = 0.70, 0.85
@@ -191,6 +191,16 @@ class PatchEmbed(nn.Module):
         B,T,Fd=x.shape; pad=(s.p-T%s.p)%s.p
         if pad: x=F.pad(x,(0,0,0,pad))
         return s.norm(s.proj(x.reshape(B,-1,s.p*Fd)))
+class ConvStem(nn.Module):   # must match btc_eth_sol_cross_train.py exactly (layer names + forward)
+    def __init__(s,n,patch=PATCH_SIZE,d=D_MODEL):
+        super().__init__(); s.p=patch
+        s.conv1=nn.Conv1d(n,d,kernel_size=3,padding=1); s.conv2=nn.Conv1d(d,d,kernel_size=3,padding=1)
+        s.down=nn.Conv1d(d,d,kernel_size=patch,stride=patch); s.act=nn.GELU(); s.norm=nn.LayerNorm(d)
+    def forward(s,x):
+        B,T,Fd=x.shape; pad=(s.p-T%s.p)%s.p
+        if pad: x=F.pad(x,(0,0,0,pad))
+        x=x.transpose(1,2); x=s.act(s.conv1(x)); x=s.act(s.conv2(x))
+        return s.norm(s.down(x).transpose(1,2))
 class RoPEEmbedding(nn.Module):
     def __init__(s,dim,base=10000): super().__init__(); inv=1.0/(base**(torch.arange(0,dim,2).float()/dim)); s.register_buffer('inv_freq',inv)
     def forward(s,L,device): t=torch.arange(L,device=device).float(); fr=torch.outer(t,s.inv_freq); emb=torch.cat([fr,fr],-1); return emb.cos(),emb.sin()
@@ -218,8 +228,10 @@ class TransformerBlock(nn.Module):
         s.ff=nn.Sequential(nn.Linear(D_MODEL,D_FF),nn.GELU(),nn.Dropout(DROPOUT),nn.Linear(D_FF,D_MODEL),nn.Dropout(DROPOUT))
     def forward(s,x): x=x+s.attn(s.n1(x)); x=x+s.ff(s.n2(x)); return x
 class TemporalTransformer(nn.Module):
-    def __init__(s,n_feat,n_assets=3,use_emb=True):
-        super().__init__(); s.se=SqueezeExcite(n_feat); s.embed=PatchEmbed(n_feat); s.blocks=nn.ModuleList([TransformerBlock() for _ in range(N_LAYERS)])
+    def __init__(s,n_feat,n_assets=3,use_emb=True,use_convstem=False):
+        super().__init__(); s.se=SqueezeExcite(n_feat)
+        s.embed=ConvStem(n_feat) if use_convstem else PatchEmbed(n_feat)
+        s.blocks=nn.ModuleList([TransformerBlock() for _ in range(N_LAYERS)])
         s.use_emb=use_emb
         if use_emb: s.asset_emb=nn.Embedding(n_assets,D_MODEL)
         s.head=nn.Sequential(nn.LayerNorm(D_MODEL),nn.Linear(D_MODEL,D_MODEL//2),nn.GELU(),nn.Dropout(DROPOUT),nn.Linear(D_MODEL//2,2))
@@ -235,9 +247,9 @@ def build():
     ckpt=torch.load(CKPT_PATH,map_location='cpu',weights_only=False)
     cfg,scaler,feat_cols=ckpt['model_cfg'],ckpt['scaler'],ckpt['feat_cols']
     seq_len=ckpt['seq_len']; vp33,vp67=ckpt.get('vol_p33'),ckpt.get('vol_p67')
-    model=TemporalTransformer(cfg['n_feat'],n_assets=cfg.get('n_assets',3),use_emb=cfg.get('use_emb',True))
+    model=TemporalTransformer(cfg['n_feat'],n_assets=cfg.get('n_assets',3),use_emb=cfg.get('use_emb',True),use_convstem=cfg.get('use_convstem',False))
     model.load_state_dict(ckpt['model_state']); model.eval()
-    print(f"  model n_feat={cfg['n_feat']}  use_emb={cfg.get('use_emb')}")
+    print(f"  model n_feat={cfg['n_feat']}  use_emb={cfg.get('use_emb')}  use_convstem={cfg.get('use_convstem',False)}")
 
     print("  building BTC+ETH+SOL features (this includes the absorption rolling-PCA)...")
     bases={a:build_base(f) for a,f in ASSETS.items()}

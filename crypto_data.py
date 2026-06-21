@@ -30,10 +30,11 @@ SLEEP       = 0.30
 START       = "2018-01-01"          # SOL simply returns from its 2020 listing
 UPDATE_DAYS = 10                    # default overlap window for --mode update
 
+# Only the columns consumed by the feature pipeline are kept. The unused Binance fields
+# (Close time, Taker buy quote asset volume, Ignore) are dropped to shrink the CSVs.
 CSV_HEADERS = [
     "Open time", "Open", "High", "Low", "Close", "Volume",
-    "Close time", "Quote asset volume", "Number of trades",
-    "Taker buy base asset volume", "Taker buy quote asset volume", "Ignore",
+    "Quote asset volume", "Number of trades", "Taker buy base asset volume",
 ]
 
 ASSETS = {"btc": "BTCUSDT", "eth": "ETHUSDT", "sol": "SOLUSDT"}
@@ -86,9 +87,9 @@ def fetch_range(symbol: str, interval: str, start_ms: int) -> list:
 
 
 def rows_to_df(rows: list) -> pd.DataFrame:
+    # raw kline indices kept: 0 open-time, 1-5 OHLCV, 7 quote-vol, 8 n-trades, 9 taker-buy-base
     data = [
-        [ms_to_str(r[0]), r[1], r[2], r[3], r[4], r[5],
-         ms_to_str(r[6]), r[7], r[8], r[9], r[10], r[11]]
+        [ms_to_str(r[0]), r[1], r[2], r[3], r[4], r[5], r[7], r[8], r[9]]
         for r in rows
     ]
     return pd.DataFrame(data, columns=CSV_HEADERS)
@@ -126,10 +127,6 @@ def check_continuity(df: pd.DataFrame, expected: pd.Timedelta, new_cutoff=None) 
 def reformat_save(merged: pd.DataFrame, path: str) -> None:
     merged = merged.sort_values("_ts").drop_duplicates("_ts").reset_index(drop=True)
     merged["Open time"] = merged["_ts"].dt.strftime("%Y-%m-%d %H:%M:%S.%f ")
-    merged["Close time"] = pd.to_datetime(
-        merged["Close time"].str.strip().str.replace(" UTC", "", regex=False),
-        utc=True, errors="coerce",
-    ).dt.strftime("%Y-%m-%d %H:%M:%S.%f ")
     merged[CSV_HEADERS].to_csv(path, index=False)
 
 

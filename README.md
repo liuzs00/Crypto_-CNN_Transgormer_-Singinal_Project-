@@ -1,119 +1,135 @@
-# BTC Multi-Timeframe Temporal Transformer — Long/Short Signal Engine
+# Crypto Multi-Asset Temporal-CNN Transformer — Long/Short Signal Engine
 
 A research-grade deep-learning pipeline that forecasts directional trading signals for
-Bitcoin (BTC-USDT) over a 4-hour horizon. The system fuses **four timeframes**
-(15m / 1h / 4h / 1d), engineers **256 scale-invariant market-microstructure and
-technical features**, and trains a custom **Temporal Transformer** (RoPE + ALiBi
-positional encoding, Squeeze-and-Excitation gating, patch embedding) with a
+**BTC** over a 4-hour horizon, trained on a **pooled BTC + ETH + SOL** universe. The system
+fuses **four timeframes** (15m / 1h / 4h / 1d), engineers **282 scale-invariant features**
+(market-microstructure, cross-asset, systemic-risk and information-theoretic), and trains a
+**temporal-CNN → Transformer** (a conv tokenizer feeding RoPE + ALiBi attention) under a
 **triple-barrier labelling scheme** from quantitative finance.
 
 > The goal is not "predict the price" — it is to frame trading as a **probabilistic,
 > risk-aware classification problem** and to engineer the full stack end-to-end:
-> data ingestion → feature engineering → labelling → model → calibration → inference.
+> data ingestion → feature engineering → labelling → model → calibration → backtest → serve.
+
+The repository carries two models: a single-asset **baseline** (`Baseline_Transformer_Train.py`)
+and the **production multi-asset model** `emb_cross_nf` (`New_CNN_Transformer_Train.py`), which
+is the focus below. Every feature and architecture change to the production model was adopted
+only after a **seed-controlled A/B protocol** (§7) — most candidate ideas were *rejected*.
 
 ---
 
-## 1. Problem Formulation
+## 1. Problem Formulation — Triple-Barrier Labelling
 
-Naïve price-direction prediction (`up` vs `down` next candle) ignores **risk/reward**
-and **path dependency**. Instead, each candle is labelled with the **Triple-Barrier
-Method** (López de Prado, *Advances in Financial Machine Learning*):
+Naïve price-direction prediction (`up` vs `down` next candle) ignores **risk/reward** and
+**path dependency**. Instead, each candle is labelled with the **Triple-Barrier Method**
+(López de Prado), with **independent long and short barriers**:
 
-| Label | Meaning | Condition (looking forward ≤ 4 candles) |
+| Label | Meaning | Condition (≤ 4 candles ahead) |
 |:---:|---|---|
-| **1** (Long) | Take-profit hit first | High reaches **+1.5%** before Low reaches −3.0% |
-| **0** (Short) | Stop-loss hit first | Low reaches **−3.0%** before High reaches +1.5% |
-| **NaN** | Ambiguous / timeout | both barriers in one candle, or neither within 4 candles → **excluded** |
+| **1** (Long) | long side wins | High reaches **+3%** before Low reaches **−1.5%**, and the short side does *not* win |
+| **0** (Short) | short side wins | Low reaches **−3%** before High reaches **+1.5%**, and the long side does *not* win |
+| **NaN** | ambiguous / timeout | otherwise → **excluded from the loss** (but kept in the sequence for context) |
 
-This encodes a concrete, asymmetric **risk-reward target** (1.5% TP vs 3.0% SL) directly
-into the learning objective. The asymmetry also produces a realistic class imbalance
-(~73% Long / 27% Short in a multi-year bull market), which the training pipeline handles
-explicitly with class weighting and focal loss.
+Each side carries a **2:1 reward:risk** target baked directly into the learning objective.
+Excluding ambiguous rows *from the loss but not the feature matrix* keeps the temporal context
+identical at train and inference time — a subtle leakage trap that this pipeline avoids.
 
 ---
 
-## 2. Architecture
+## 2. Architecture — Temporal CNN → Transformer
 
 ```
-            ┌──────────────────────────────────────────────────────────┐
-            │  4 timeframes (15m / 1h / 4h / 1d)  →  256 features        │
-            │  aligned to the 4h grid via backward merge-asof           │
-            └──────────────────────────────────────────────────────────┘
-                                      │  sequence of 64 candles (≈11 days)
-                                      ▼
-        Squeeze-and-Excitation gate   →  learns which feature channels matter
-                                      ▼
-        Patch Embedding (4 steps→1 token)  →  16 tokens, denoises micro-jitter
-                                      ▼
-        ┌───────────── Temporal Transformer × 3 layers ─────────────┐
-        │   Pre-LayerNorm  ·  8-head attention                      │
-        │   RoPE  (relative position via Q/K rotation)              │
-        │   ALiBi (linear distance recency bias, parameter-free)    │
-        │   GELU feed-forward (d_ff = 512)                          │
-        └───────────────────────────────────────────────────────────┘
-                                      ▼
-                 Mean-pool over tokens  →  2-layer MLP head  →  P(Long), P(Short)
+   BTC + ETH + SOL  ·  4 timeframes (15m/1h/4h/1d)  →  282 features
+   aligned to the 4h grid via backward merge-asof
+                         │  sequence of 64 candles (≈11 days)
+                         ▼
+   Squeeze-and-Excitation gate        per-sample feature-channel recalibration
+                         ▼
+   Temporal Conv Stem                 two overlapping Conv1d(k=3) layers capture local
+   (ConvStem)                         candle motifs ACROSS patch boundaries, then a strided
+                         │             conv downsamples 64 → 16 tokens (learned tokenizer)
+                         ▼
+   ┌──────── Transformer × 3 layers ────────┐
+   │  Pre-LayerNorm · 8-head attention      │
+   │  RoPE  (relative position via Q/K)     │
+   │  ALiBi (linear recency bias, no params)│
+   │  GELU feed-forward (d_ff = 512)        │
+   └─────────────────────────────────────────┘
+                         ▼
+   mean-pool  +  learnable per-asset embedding  →  2-layer MLP head  →  P(Long), P(Short)
 ```
 
-- **~1.9M parameters**, `d_model = 256`, sequence length 64, patch size 4.
-- **RoPE + ALiBi** are combined deliberately: RoPE encodes *relative position* inside the
-  attention dot-product, while ALiBi adds an explicit *recency* penalty — both are
-  parameter-free and well-suited to non-stationary financial series where recent context
-  dominates.
-- **Squeeze-and-Excitation** performs global feature-channel recalibration, letting the
-  network down-weight noisy indicators per-sample.
+- **~2.3M parameters**, `d_model = 256`, sequence length 64, patch size 4.
+- **Temporal conv stem** replaces the usual linear patch projection. Its overlapping
+  receptive field sees local candle formations *across* patch boundaries (a non-overlapping
+  linear patch cannot), which is a better *inductive bias* — validation loss **improved**
+  despite the extra parameters. It is the first architecture change in the project to beat the
+  data/feature levers (§7). The linear-patch tokenizer remains available as an ablation.
+- **Asset embedding:** a learnable per-asset bias added to the pooled vector, so shared layers
+  learn universal structure while the embedding absorbs per-asset idiosyncrasy.
+- **RoPE + ALiBi** combine relative position with an explicit recency prior — both
+  parameter-free and well-suited to non-stationary financial series.
 
 ---
 
-## 3. Feature Engineering (256 features)
+## 3. Feature Engineering (282 features)
 
-All features are **scale-invariant** (ratios, returns, z-scores, ATR-normalised) so the
-model generalises across BTC's 10×+ price range from 2018–2026.
+All features are **scale-invariant** (ratios, returns, z-scores, ATR-normalised) and strictly
+**causal**, so the model generalises across BTC's 10×+ price range and pools cleanly across
+assets. Full dictionary in [FEATURES.md](FEATURES.md).
 
-**Market microstructure / order flow** (from raw exchange fields)
-- Taker buy-pressure ratio & deviation; signed **Order-Flow Imbalance (OFI)** at 5/10/20 windows
-- **VPIN** proxy (flow toxicity), OFI momentum, OFI–price divergence
-- **Amihud illiquidity**, volume-synchronised volatility, trade intensity & average trade size
+**Per-timeframe** (×4 timeframes)
+- **Microstructure / order flow:** taker buy-pressure, signed **Order-Flow Imbalance (OFI)**,
+  **VPIN** toxicity, OFI–price divergence, **Amihud illiquidity**, trade intensity/size.
+- **Volatility & jumps:** ATR ratios, Bollinger %B/bandwidth, realised vol, **Realised Bipower
+  Variation jump ratio** (diffusion vs jump), liquidity-sweep detection.
+- **Trend / momentum:** EMA cascade (9/21/50/200), ATR-normalised MACD, RSI, Stochastic,
+  Williams %R, CCI, full Ichimoku cloud, OBV, multi-horizon returns, skew/kurtosis, autocorr.
+- **Anchored VWAP distance** — price vs the weekly/monthly volume-weighted cost basis.
+- **Path entropy** — Bandt-Pompe **permutation entropy** of recent log-price: low = trending
+  (momentum reliable), high = chop (favour reversion). Encodes path *predictability* that
+  realised vol (a magnitude measure) misses.
 
-**Volatility & jump structure**
-- ATR (7/14) ratios, Bollinger bandwidth/%B, realised volatility (10/20)
-- **Realised Bipower Variation** jump ratio (RV/RBV) — separates diffusion from jumps
-- Liquidity-sweep detection (wick × volume spike), range efficiency
-
-**Trend / momentum / oscillators**
-- EMA ratio cascade (9/21/50/200), MACD (ATR-normalised), RSI (7/14)
-- Stochastic, Williams %R, CCI, Ichimoku cloud (TK cross, price-vs-cloud, cloud depth)
-- OBV z-score, multi-horizon returns, rolling skew/kurtosis, return autocorrelation
-
-**Cross-timeframe divergence**
-- 4h-vs-1d and 4h-vs-1h RSI/MACD divergence, 4h-vs-1d volume ratio — captures
-  regime conflict between fast and slow horizons.
+**Cross-asset & systemic** (each asset vs the rest of the universe)
+- Relative return/vol/RSI, β and correlation to the universe, cross-sectional rank.
+- **Absorption Ratio** — variance share of the 1st principal component of the BTC/ETH/SOL
+  return covariance (rolling PCA): a systemic-fragility / "assets in lockstep" signal.
 
 ---
 
-## 4. Training Methodology
+## 4. Multi-Asset Pooling (leak-safe)
+
+Training rows are **pooled across BTC + ETH + SOL** — more, more-diverse, higher-vol data —
+while validation and test stay **BTC-only**:
+
+- Train/val boundaries are taken from BTC's labelled timeline at fixed 70/85 fractions, and
+  every ETH/SOL row from the val/test era is dropped → the BTC test candles are *identical* to
+  the single-asset baseline, keeping every experiment comparable.
+- The `RobustScaler` (5–95 quantile, clipped ±6) is fit on the **pooled training partition only**.
+- Cross-asset / absorption features use only *contemporaneous* (≤ t) values of the other
+  assets — no look-ahead.
+
+---
+
+## 5. Training Methodology
 
 | Component | Choice | Rationale |
 |---|---|---|
 | Loss | **Focal loss + label smoothing (0.1)** | focus on hard examples; avoid overconfident plateau |
-| Class weighting | inverse-frequency (configurable Short factor) | counter the 73/27 Long/Short imbalance |
+| Class weighting | inverse-frequency (configurable Short factor) | counter the Long/Short imbalance |
 | Augmentation | Gaussian jitter + random feature masking | regularise against noisy, non-stationary inputs |
-| Schedule | LR warmup → cosine decay | stable early training, smooth convergence |
+| Schedule | LR warmup → cosine decay (AdamW, grad-clip) | stable early training, smooth convergence |
 | Split | **chronological** 70 / 15 / 15 | no look-ahead leakage; scaler fit on train only |
-| Scaling | `RobustScaler` (5–95 quantile) + clip ±6 | robust to fat-tailed crypto outliers |
-| Early stopping | patience on validation loss | prevent overfitting |
-
-**Leakage discipline:** sequences are built from the *full* row matrix so that the
-temporal context at **training time is identical to inference time**, and the feature
-scaler is fit strictly on the training partition.
+| Reproducibility | optional `SEED` (fixes init/shuffle/dropout) | clean **paired A/B** comparisons |
+| Early stopping | patience on validation loss | restore best-val weights before test |
 
 ---
 
-## 5. Volatility-Regime-Adaptive Thresholding
+## 6. Volatility-Regime-Adaptive Thresholding
 
-A single probability cutoff is suboptimal across volatility regimes. The engine classifies
-each candle into **low / mid / high** ATR regimes (percentile boundaries learned on the
-training set) and applies regime-specific LONG/SHORT confidence gates:
+A single probability cutoff is suboptimal across volatility regimes. The engine classifies each
+candle into **low / mid / high** ATR regimes (percentile boundaries fit on the training set,
+serialised into the checkpoint) and applies regime-specific confidence gates:
 
 | Regime | Long thr | Short thr | Intuition |
 |---|:---:|:---:|---|
@@ -121,90 +137,126 @@ training set) and applies regime-specific LONG/SHORT confidence gates:
 | Mid vol | 0.60 | 0.40 | balanced |
 | High vol | 0.72 | 0.28 | demand high conviction in chaos |
 
-A dedicated calibration script (`btc_threshold_tuning.py`) performs a **3-stage grid search**
-(regime boundaries → per-regime thresholds → joint fine-tune) optimising a
-**precision-weighted objective** and an **expected-PnL** proxy
-(`prec·TP − (1−prec)·SL`), subject to minimum-coverage constraints.
+`btc_threshold_tuning.py` performs a **3-stage grid search** (regime boundaries → per-regime
+thresholds → joint fine-tune) optimising a precision-weighted + **expected-PnL** objective.
 
 ---
 
-## 6. Representative Results (held-out test set)
+## 7. Empirical Adoption Protocol (how features/architecture earn their place)
+
+Every proposed change is run as a **seed-paired A/B** (a fixed `SEED` makes weight-init,
+shuffling and dropout identical, so only the change differs) and judged on **active-signal
+accuracy across ≥ 3 seeds**, with a **coverage check** (an accuracy gain from simply trading
+fewer bars is conservatism, not quality). Architecture changes additionally require a
+**multi-seed backtest** confirmation — trusting profit factor / Calmar (robust) over total
+return (compounded, path-dependent).
+
+| Idea | Type | Verdict |
+|---|---|---|
+| Path entropy | feature | **adopted** — +1.3pp active acc, 3/3 seeds |
+| Temporal conv stem | architecture | **adopted** — +2.66pp acc 3/3; PF 5/5, Calmar +60% in backtest |
+| Wavelet (DWT) coeffs · Hawkes self-excitation · fractional differencing · gated attention pooling | — | **rejected** — did not replicate across seeds |
+
+The recurring lesson: **data (multi-asset) and orthogonal features move the needle; heavy
+architecture changes do not — except a minimal tokenizer upgrade that preserves the working
+transformer.** Rejecting four plausible ideas is as much the point as adopting two.
+
+---
+
+## 8. Representative Results (held-out BTC test set)
 
 | Metric | Value |
 |---|---|
 | Directional accuracy (argmax) | **~0.70** |
-| **Long** precision | **~0.82** |
-| Short precision | ~0.45–0.50 |
-| Confidence-filtered accuracy | **~0.72** |
+| Confidence-filtered (active-signal) accuracy | **~0.74** |
+| Backtest profit factor (per-signal) | **~1.95** |
+| Backtest max drawdown | **~ −24%** |
 
-The model is intentionally **stronger on Long than Short** — the asymmetric barriers make
-a −3% down-move twice as hard to trigger as a +1.5% up-move, and shorts are rarer in a bull
-market. This is surfaced honestly rather than hidden, and is exactly the kind of
-class-conditional behaviour a risk desk needs to understand before sizing positions.
+In a research backtest (test split, **0.05% fee/side, no slippage/funding, single window,
+intrabar-fill assumption**) the strategy compounds strongly positive vs a negative buy-&-hold
+over the same window, with both long and short sides positive-expectancy. Headline compounded
+return is high but is the *least* reliable statistic; profit factor, per-trade expectancy and
+drawdown (the robust measures) are what the conv-stem A/B improved.
 
-> *Disclaimer: research project for skill demonstration. Not financial advice and not a
-> live trading system.*
-
----
-
-## 7. Engineering & Interpretability
-
-- **Attention-map analysis**: column-sum "received attention" per patch, per-layer entropy,
-  recency ratios, and Long-vs-Short attention profiles — used to verify the model attends to
-  recent context and to compare correct vs incorrect predictions.
-- **Reproducible inference**: training and `btc_predict.py` produce **bit-identical
-  probabilities** for the same timestamp (verified to < 1e-7), with regime boundaries
-  serialised into the checkpoint so calibration never drifts between train and serve.
-- **Automated data layer** (`cmc_api.py`): pulls fresh Binance klines, drops the still-forming
-  candle, **merges into the historical CSVs with de-duplication and continuity checks** across
-  all four timeframes.
+> *Disclaimer: research project for skill demonstration. Not financial advice, not a live
+> trading system. Backtests overstate live performance.*
 
 ---
 
-## 8. Repository Structure
+## 9. Code Architecture & Interpretability
+
+The production line is **modular**, with one source of truth each for features, model and
+metrics — so the trainer, backtest and predict scripts cannot drift out of train/serve parity
+(the bug class that previously caused a train/inference mismatch):
 
 ```
-├── cmc_api.py                # Binance updater: fetch → de-dup → continuity check → merge
-├── btc_lstm_train.py         # Feature engineering + Temporal Transformer training
-├── btc_predict.py            # Inference CLI (default last 24h, or any date range)
-├── btc_threshold_tuning.py   # 3-stage regime/threshold calibration
-├── btc_lstm_tuning.py        # Sequential hyperparameter search (staged, resumable)
-├── btc_lstm_tuning_r2.py     # Second-round refinement search
-├── DATA/                     # Multi-timeframe OHLCV (2018 → present)
-└── btc_lstm_model.pth        # Trained checkpoint (weights + scaler + feat cols + regime bounds)
+crypto_features.py   feature pipeline + config        ← imported by train / backtest / predict
+crypto_model.py      ConvStem + Transformer (from_cfg) ← single model definition
+crypto_metrics.py    evaluate · regime gates · attention analysis
+```
+
+- **Attention-map analysis** (in `crypto_metrics.py`): received-attention per patch, per-layer
+  entropy, recency ratios, and Long-vs-Short / correct-vs-wrong profiles.
+- **Reproducible inference:** the checkpoint bundles weights + fitted scaler + ordered
+  feature list + regime boundaries + `model_cfg`, so the model is reconstructed exactly at
+  serve time (`TemporalTransformer.from_cfg`); backtest output is byte-identical to the trainer.
+- **Automated data layer** (`crypto_data.py`): pulls fresh Binance klines (UTC), drops the
+  still-forming candle, and **merges into the historical CSVs with de-duplication + continuity
+  checks** across all three assets × four timeframes.
+
+---
+
+## 10. Repository Structure
+
+```
+├── crypto_data.py                 # Binance fetch/update (BTC/ETH/SOL): de-dup + continuity merge
+├── crypto_features.py             # SHARED feature pipeline + config (282 features)
+├── crypto_model.py                # SHARED model: temporal conv stem + RoPE/ALiBi transformer
+├── crypto_metrics.py              # SHARED evaluation + regime gates + attention analysis
+├── New_CNN_Transformer_Train.py   # Production trainer (BTC+ETH+SOL pooled) — thin orchestrator
+├── Baseline_Transformer_Train.py  # Single-asset baseline trainer (frozen reference)
+├── btc_backtest_cross_nf.py       # Backtest the production model (triple-barrier trade sim)
+├── btc_predict_cross_nf.py        # Live signal: auto-fills the data gap, then predicts
+├── btc_threshold_tuning.py        # 3-stage regime/threshold calibration
+├── FEATURES.md                    # Full 282-feature dictionary
+├── TECHNICAL_REPORT.md            # Architecture + feature-construction deep dive
+├── DATA/                          # Multi-asset, multi-timeframe OHLCV (2018 → present, UTC)
+└── btc_eth_sol_pooled_model_emb_cross_nf.pth   # Production checkpoint
 ```
 
 ---
 
-## 9. Usage
+## 11. Usage
 
 ```bash
-# 1. Refresh data (merges latest Binance candles into the historical CSVs)
-python cmc_api.py
+# 1. Refresh data (merge latest Binance candles into the historical CSVs; de-dup + continuity)
+python crypto_data.py                      # update all assets / timeframes
 
-# 2. Train the model
-python btc_lstm_train.py
+# 2. Train the production model (defaults to the production config: 282 feat + conv stem)
+python New_CNN_Transformer_Train.py
+python New_CNN_Transformer_Train.py        # ablations via env: NEWFEAT=0, CONVSTEM=0, SEED=0 …
 
-# 3. Generate signals
-python btc_predict.py                              # last 24 hours (default)
-python btc_predict.py --days 7                      # last 7 days
-python btc_predict.py --from 2026-06-01             # from a date to latest
-python btc_predict.py --from 2026-06-01 --to 2026-06-10
-python btc_predict.py --from "2026-06-01 08:00" --to "2026-06-03 20:00"
+# 3. Live signals (auto-fills the data gap from the last candle, then scores)
+python btc_predict_cross_nf.py             # last 24 h (default)
+python btc_predict_cross_nf.py --days 7    # last 7 days
+python btc_predict_cross_nf.py --from 2026-06-01 --to 2026-06-10
+python btc_predict_cross_nf.py --no-update # skip the data refresh
 
-# 4. (Optional) Calibrate regime thresholds
-python btc_threshold_tuning.py
+# 4. Backtest the production model
+python btc_backtest_cross_nf.py            # BTC test split (default)
 ```
 
-Output: `btc_recent_signals.csv` — `timestamp, prob_long, prob_short, signal, vol_regime, thresholds`.
+Output: `btc_predict_cross_nf_signals.csv` — `timestamp, close, prob_long, vol_regime, signal`.
 
 ---
 
-## 10. Tech Stack
+## 12. Tech Stack
 
 `PyTorch` · `NumPy` / `pandas` · `scikit-learn` · `matplotlib` · Binance REST API
 
-**Concepts demonstrated:** Transformer architecture design (RoPE, ALiBi, SE, patch
-embedding) · focal loss & class imbalance · time-series cross-validation without leakage ·
-market microstructure (OFI, VPIN, Amihud) · triple-barrier labelling · volatility-regime
-modelling · probability calibration · model interpretability.
+**Concepts demonstrated:** temporal-CNN + Transformer design (conv tokenizer, RoPE, ALiBi, SE,
+asset embedding) · multi-asset pooled training without leakage · triple-barrier labelling ·
+market microstructure (OFI, VPIN, Amihud) · cross-asset / PCA-absorption / permutation-entropy
+features · focal loss & class imbalance · volatility-regime calibration · **seed-controlled A/B
+experimentation** · multi-seed backtest validation · modular train/serve-parity architecture ·
+model interpretability.

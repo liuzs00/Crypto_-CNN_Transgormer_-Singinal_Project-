@@ -29,9 +29,11 @@ def regime_signals(p_long, vol, p33, p67):
     return sig, regime, long_thr, short_thr
 
 
-def evaluate(model, test_dl, Xte, vol_idx, atr_tr_btc, device, tag):
-    """Run the BTC test set, print argmax + confidence-filtered reports, and return results.
-    Returns dict with sig, regime, p_long, tprobs, ttrue, p33, p67."""
+def evaluate(model, test_dl, Xte, vol_idx, atr_tr_btc, device, tag,
+             feat_cols=None, X_train=None, price_path=None):
+    """Run the BTC test set, print argmax + confidence-filtered reports + extended metrics A–E.
+    Returns dict with sig, regime, p_long, tprobs, ttrue, p33, p67.
+    feat_cols + X_train (train sequences) enable Metric D (PSI); price_path enables Metric E (MAE)."""
     model.eval()
     tpreds, tprobs, ttrue = [], [], []
     import torch
@@ -56,7 +58,107 @@ def evaluate(model, test_dl, Xte, vol_idx, atr_tr_btc, device, tag):
         print("Confusion matrix:"); print(confusion_matrix(ttrue[mask], sig[mask]))
     print(f"\nProb(Long) — mean:{p_long.mean():.3f}  std:{p_long.std():.3f}  "
           f"min:{p_long.min():.3f}  max:{p_long.max():.3f}")
+    extended_report(p_long, ttrue, sig, feat_cols=feat_cols,
+                    X_train=(X_train[:, -1, :] if X_train is not None else None),
+                    X_test=(Xte[:len(ttrue), -1, :] if X_train is not None else None),
+                    price_path=price_path)
     return dict(sig=sig, regime=regime, p_long=p_long, tprobs=tprobs, ttrue=ttrue, p33=float(p33), p67=float(p67))
+
+
+# ══════════════════════════════════════════════════════════════════
+# EXTENDED METRICS  (A–E)
+# ══════════════════════════════════════════════════════════════════
+def calibration(p_long, y_true, n_bins=10):
+    """Metric A — Brier score + Expected Calibration Error for P(long). Lower = better."""
+    p = np.asarray(p_long, float); y = np.asarray(y_true, float)
+    brier = float(np.mean((p - y) ** 2))
+    edges = np.linspace(0, 1, n_bins + 1); ece = 0.0; N = max(len(p), 1)
+    for b in range(n_bins):
+        hi = edges[b + 1] + (1e-9 if b == n_bins - 1 else 0)
+        m = (p >= edges[b]) & (p < hi)
+        if m.sum() == 0: continue
+        ece += (m.sum() / N) * abs(p[m].mean() - y[m].mean())   # |confidence − accuracy|
+    return brier, float(ece)
+
+
+def class_profit_factor(sig, y_true, ltp=0.03, lsl=0.015, stp=0.03, ssl=0.015):
+    """Metric B — barrier-implied profit factor + expectancy per signal class (gross of fees).
+    sig codes: 1=LONG, 0=SHORT, -1=NEUTRAL. y_true: 1=long-wins, 0=short-wins."""
+    out = {}
+    for name, code, win, tp, sl in [('Long', 1, 1, ltp, lsl), ('Short', 0, 0, stp, ssl)]:
+        m = sig == code
+        if m.sum() == 0: out[name] = None; continue
+        correct = (y_true[m] == win)
+        g = correct.sum() * tp; l = (~correct).sum() * sl
+        out[name] = dict(n=int(m.sum()), win=float(correct.mean()),
+                         pf=(g / l if l > 0 else float('inf')), exp=float((g - l) / m.sum()))
+    return out
+
+
+def signal_clustering(sig):
+    """Metric C — autocorrelation / clustering of the signal stream (>0 = signals persist/cluster).
+    sig codes: 1=LONG, 0=SHORT, -1=NEUTRAL."""
+    s = np.where(sig == 1, 1.0, np.where(sig == 0, -1.0, 0.0))   # signed direction
+    a = (sig != -1).astype(float)                                # active indicator
+    def ac(x, k):
+        if len(x) <= k + 1 or x.std() == 0: return float('nan')
+        return float(np.corrcoef(x[:-k], x[k:])[0, 1])
+    return dict(dir_ac1=ac(s, 1), dir_ac6=ac(s, 6), active_ac1=ac(a, 1))
+
+
+def psi(X_ref, X_cur, feat_cols, n_bins=10):
+    """Metric D — Population Stability Index per feature (reference=train vs current=test).
+    <0.1 stable · 0.1–0.25 minor shift · >0.25 major shift. Returns {feature: psi}."""
+    vals = {}
+    for j, name in enumerate(feat_cols):
+        ref = X_ref[:, j]; cur = X_cur[:, j]
+        q = np.quantile(ref, np.linspace(0, 1, n_bins + 1)); q[0] = -np.inf; q[-1] = np.inf
+        rh = np.histogram(ref, q)[0] / max(len(ref), 1) + 1e-6
+        ch = np.histogram(cur, q)[0] / max(len(cur), 1) + 1e-6
+        vals[name] = float(np.sum((ch - rh) * np.log(ch / rh)))
+    return vals
+
+
+def max_adverse_excursion(close, high, low, entries, dirs, timeout):
+    """Metric E — Maximum Adverse Excursion per trade: worst adverse move (fraction of entry
+    price) before the time barrier. entries: candle indices; dirs: 'LONG'/'SHORT'."""
+    n = len(close); out = []
+    for i, dr in zip(entries, dirs):
+        i = int(i); ref = close[i]; e = min(i + 1 + timeout, n)
+        seg_lo = low[i + 1:e]; seg_hi = high[i + 1:e]
+        if len(seg_lo) == 0 or ref <= 0: out.append(0.0); continue
+        adv = (ref - seg_lo.min()) / ref if dr == 'LONG' else (seg_hi.max() - ref) / ref
+        out.append(max(float(adv), 0.0))
+    return np.array(out)
+
+
+def extended_report(p_long, y_true, sig, *, feat_cols=None, X_train=None, X_test=None,
+                    price_path=None, barriers=(0.03, 0.015, 0.03, 0.015)):
+    """Print extended metrics A–E. D (PSI) runs if X_train/X_test/feat_cols given; E (MAE) if
+    price_path=(close, high, low, entries, timeout) given."""
+    print("\n" + "=" * 55); print("EXTENDED METRICS (A–E)"); print("=" * 55)
+    brier, ece = calibration(p_long, y_true)
+    print(f"  A. Calibration    Brier:{brier:.4f}   ECE:{ece:.4f}   (lower = better calibrated)")
+    print(f"  B. Per-class profit factor / expectancy (barrier-implied, gross):")
+    for k, v in class_profit_factor(sig, y_true, *barriers).items():
+        if v: print(f"       {k:5s} n={v['n']:4d}  win={v['win']*100:4.1f}%  PF={v['pf']:4.2f}  exp/sig={v['exp']*100:+5.2f}%")
+    sc = signal_clustering(sig)
+    print(f"  C. Signal autocorr  dir_ac1:{sc['dir_ac1']:+.3f}  dir_ac6:{sc['dir_ac6']:+.3f}  "
+          f"active_ac1:{sc['active_ac1']:+.3f}   (>0 = clustered/persistent)")
+    if X_train is not None and X_test is not None and feat_cols is not None:
+        ps = psi(X_train, X_test, feat_cols); arr = np.array(list(ps.values())); names = list(ps)
+        order = np.argsort(arr)[::-1]
+        print(f"  D. PSI train→test  mean:{arr.mean():.3f}  max:{arr.max():.3f}  "
+              f"(major>0.25:{int((arr>0.25).sum())}  minor:{int(((arr>0.1)&(arr<=0.25)).sum())} of {len(arr)})")
+        print("       top drift: " + ", ".join(f"{names[i]}={arr[i]:.2f}" for i in order[:5]))
+    if price_path is not None:
+        close, high, low, entries, timeout = price_path
+        m = sig != -1
+        if m.sum() and len(entries) == len(sig):
+            dirs = np.where(sig[m] == 1, 'LONG', 'SHORT')
+            mae = max_adverse_excursion(close, high, low, np.asarray(entries)[m], dirs, timeout)
+            print(f"  E. Max Adverse Excursion (active trades)  mean:{mae.mean()*100:.2f}%  "
+                  f"median:{np.median(mae)*100:.2f}%  p90:{np.percentile(mae,90)*100:.2f}%")
 
 
 def attention_analysis(model, test_dl, Xte, feat_cols, sig, ttrue, device, tag, save_dir,

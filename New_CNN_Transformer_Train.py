@@ -169,9 +169,13 @@ for ep in range(1, EPOCHS+1):
     if no_imp >= PATIENCE: print(f"  → Early stop at epoch {ep}"); break
 print(f"\nBest val loss (BTC): {best_val:.4f}")
 
-# ── evaluation (shared) + save ────────────────────────────────────
+# ── evaluation (shared, incl. extended metrics A–E) + save ────────
 model.load_state_dict(best_state)
-res = M.evaluate(model, test_dl, Xte, vol_idx, atr_tr_btc, device, TAG)
+_btc = bases['btc']
+_price = (_btc['Close'].values, _btc['High'].values, _btc['Low'].values,
+          np.searchsorted(_btc['timestamp'].values, ts_te), FE.TB_TIMEOUT)   # MAE path
+res = M.evaluate(model, test_dl, Xte, vol_idx, atr_tr_btc, device, TAG,
+                 feat_cols=feat_cols, X_train=Xtr, price_path=_price)         # +PSI (Xtr) +MAE
 sig, regime, p_long, tprobs, ttrue, p33, p67 = (res['sig'], res['regime'], res['p_long'],
                                                 res['tprobs'], res['ttrue'], res['p33'], res['p67'])
 

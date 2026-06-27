@@ -20,7 +20,13 @@ Usage:
     py -3.10 btc_predict_cross_nf.py --from 2026-06-01 --to 2026-06-10
     py -3.10 btc_predict_cross_nf.py --no-update              # skip the data refresh
 
-Output: btc_predict_cross_nf_signals.csv  —  timestamp, close, prob_long, vol_regime, signal
+Each active signal also carries an **M2 meta-label** (btc_meta_label.py): a confidence score
+and a continuous **recommended size** (0 = skip, 1 = full position) that scales exposure by
+how likely M2 thinks the trade is to be profitable. If the M2 model file is absent the tool
+still runs (size column shows "-").
+
+Output: btc_predict_cross_nf_signals.csv  —  timestamp, close, prob_long, vol_regime, signal,
+        m2_confidence, recommended_size
 """
 import os, sys, argparse, subprocess
 try:
@@ -30,6 +36,7 @@ except Exception:
 import numpy as np, pandas as pd
 import btc_backtest_cross_nf as BT     # reuse build(): feature pipeline + model + thresholds
 import btc_predict as P                # parse_dt + regime-threshold constants
+import btc_meta_label as ML            # M2 meta-label: confidence + recommended size
 
 OUT_CSV = os.path.join(BT.SAVE_DIR, 'btc_predict_cross_nf_signals.csv')
 THR = {'low': P.THRESH_LOW_VOL, 'mid': (P.LONG_THRESH, P.SHORT_THRESH), 'high': P.THRESH_HIGH_VOL}
@@ -120,29 +127,54 @@ def main():
         return
     tip = rows[-1]                          # most recent candle in the window
 
+    # ── M2 meta-label: confidence + recommended size for active signals (frozen M1 + M2) ──
+    m2conf = {i: np.nan for i in rows}; m2size = {i: 0.0 for i in rows}; m2_on = False
+    act = [i for i in rows if sig[i] != 'NEUTRAL']
+    try:
+        ml = ML.load_m2()
+        if act:
+            is_long = np.array([sig[i] == 'LONG' for i in act])
+            Xm = ML.m2_features(d, act, is_long, np.array([probs[i] for i in act]))[ml['feat_order']]
+            pc = ml['m2'].predict_proba(Xm)[:, 1]
+            for k, i in enumerate(act):
+                m2conf[i] = float(pc[k]); m2size[i] = ML.recommended_size(pc[k], ml['skip_thr'], ml['full_thr'])
+        m2_on = True
+    except Exception as e:
+        print(f"  (M2 meta-label unavailable — run btc_meta_label.py to train it: {e})")
+
+    def _m2cell(i):
+        if sig[i] != 'NEUTRAL' and m2_on and not np.isnan(m2conf[i]):
+            return f"{m2conf[i]:.3f}", f"{m2size[i]:.2f}"
+        return "  -  ", "  - "
+
+    tip_x = ""
+    if sig[tip] != 'NEUTRAL' and m2_on and not np.isnan(m2conf[tip]):
+        tip_x = f"   M2conf={m2conf[tip]:.3f}  size={m2size[tip]:.2f}×"
     print(f"\n  candles: {n:,}   latest scored: {latest:%Y-%m-%d %H:%M} UTC   close: {close[last]:,.2f}")
-    print("\n" + "=" * 70)
-    print(f"  LATEST SIGNAL  →  {sig[tip]}     P(long)={probs[tip]:.4f}   regime={regime[tip]}")
-    print("=" * 70)
+    print("\n" + "=" * 78)
+    print(f"  LATEST SIGNAL  →  {sig[tip]}     P(long)={probs[tip]:.4f}   regime={regime[tip]}{tip_x}")
+    print("=" * 78)
 
     print(f"\n  Signals — {label}  ({len(rows)} candles):")
-    print(f"  {'Timestamp (UTC)':<18} {'Close':>11} {'P_long':>8} {'Regime':>7} {'L/S thr':>9}  Signal")
-    print(f"  {'-'*70}")
+    print(f"  {'Timestamp (UTC)':<18} {'Close':>11} {'P_long':>8} {'Regime':>7} {'L/S thr':>9} {'Signal':<8} {'M2conf':>7} {'Size':>5}")
+    print(f"  {'-'*78}")
     for i in rows:
-        lt, st = THR[regime[i]]
-        mark = '  *' if sig[i] != 'NEUTRAL' else ''
+        lt, st = THR[regime[i]]; mc, sz = _m2cell(i)
         print(f"  {ts_all[i]:%Y-%m-%d %H:%M} {close[i]:>11,.2f} {probs[i]:>8.4f} "
-              f"{regime[i]:>7} {lt:>4.2f}/{st:<4.2f} {sig[i]}{mark}")
+              f"{regime[i]:>7} {lt:>4.2f}/{st:<4.2f} {sig[i]:<8} {mc:>7} {sz:>5}")
 
     pd.DataFrame({
-        'timestamp':  [ts_all[i] for i in rows],
-        'close':      [close[i] for i in rows],
-        'prob_long':  [probs[i] for i in rows],
-        'vol_regime': [regime[i] for i in rows],
-        'signal':     [sig[i] for i in rows],
+        'timestamp':        [ts_all[i] for i in rows],
+        'close':            [close[i] for i in rows],
+        'prob_long':        [probs[i] for i in rows],
+        'vol_regime':       [regime[i] for i in rows],
+        'signal':           [sig[i] for i in rows],
+        'm2_confidence':    [m2conf[i] for i in rows],
+        'recommended_size': [m2size[i] for i in rows],
     }).to_csv(OUT_CSV, index=False)
     n_act = sum(sig[i] != 'NEUTRAL' for i in rows)
-    print(f"\n  Active in window: {n_act}/{len(rows)}   Saved → {os.path.basename(OUT_CSV)}")
+    print(f"\n  Active in window: {n_act}/{len(rows)}   (Size = fraction of full position, M2-scaled)")
+    print(f"  Saved → {os.path.basename(OUT_CSV)}")
 
 
 if __name__ == '__main__':

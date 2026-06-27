@@ -68,7 +68,8 @@ def build():
     lab_end = np.array([i for i in range(seq_len, n+1) if valid[i-1]])
     t_tr = lab_end[int(len(lab_end)*TRAIN_FRAC)]-1; t_va = lab_end[int(len(lab_end)*VAL_FRAC)]-1
     split = np.where(np.arange(n) < t_tr, 'train', np.where(np.arange(n) < t_va, 'val', 'test'))
-    return dict(ts=ts, close=close, high=high, low=low, n=n, probs=probs, sig=sig, regime=regime, split=split)
+    return dict(ts=ts, close=close, high=high, low=low, n=n, probs=probs, sig=sig, regime=regime, split=split,
+                X=X, feat_cols=feat_cols)   # X (scaled features) + feat_cols exposed for meta-labeling
 
 
 def main():

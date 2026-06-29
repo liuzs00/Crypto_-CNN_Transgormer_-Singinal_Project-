@@ -3,11 +3,14 @@
 **Scope.** This report documents (1) the network architecture, (2) the feature-construction
 pipeline, and (3) the training, labelling, calibration, and evaluation techniques used in the
 BTC long/short signal engine. Sections **1–8** describe the core single-asset engine
-(`btc_lstm_train.py` / `btc_predict.py`, 256 features). Section **9** documents the
-**production multi-asset model** `emb_cross_nf` (`btc_eth_sol_cross_train.py`,
-`btc_backtest_cross_nf.py`, 282 features) — how it extends the core with multi-asset pooling,
-additional feature families, per-direction barriers, and a temporal-conv tokenizer, all
-adopted under a seed-controlled empirical protocol.
+(`Baseline_Transformer_Train.py` / `btc_predict.py`, 256 features). Section **9** documents the
+**production multi-asset model** `emb_cross_nf` (`New_CNN_Transformer_Train.py`,
+`btc_backtest_cross_nf.py`, 282 features) — multi-asset pooling, additional feature families,
+per-direction barriers, and a temporal-conv tokenizer, all adopted under a seed-controlled
+empirical protocol. Section **10** documents the **meta-labeling (M2) sizing layer** — a
+secondary ensemble model that turns M1's direction into a confidence-scaled position size.
+The feature/model/metric code is modular (`crypto_features.py` / `crypto_model.py` /
+`crypto_metrics.py`) and shared across train, backtest and serve so they cannot drift.
 
 ---
 
@@ -317,7 +320,50 @@ transformer.
 
 ---
 
-## 10. Techniques Checklist (for quick reference)
+## 10. Meta-Labeling (M2) — Confidence-Scaled Position Sizing
+
+A second model decides *how much* to trade, separating **direction** (M1) from **sizing** (M2)
+— the López de Prado meta-labeling pattern.
+
+### 10.1 Two-stage design
+- **M1** (the frozen conv-stem transformer) decides **direction** only.
+- **M2** scores whether each M1 signal will be **profitable** (target = realised trade `net > 0`)
+  and emits a **confidence** + a continuous **recommended size** (0 = skip → 1 = full position),
+  scaling exposure by how likely the trade is to pay and zeroing out the weak signals.
+
+### 10.2 M2 model & features
+- **Ensemble:** soft-vote (mean probability) of **HistGradientBoosting (≈ LightGBM) +
+  RandomForest** — boosting + bagging diversity; the blend beat GBM-alone 6/6 on the walk-forward.
+- **13 curated features (not all 282):** M1 conviction (P, signed conviction, direction) +
+  regime/vol context (ATR, realised vol, Bollinger width, PCA absorption, relative vol, trend) +
+  an ~11-day rolling macro-vol. M2 *judges the regime*; it must not relearn M1's direction call.
+- **Shared `m2_features()`** between training and serving → no train/serve drift (same discipline
+  as the M1 modular refactor).
+- **Sizing curve:** `size = clip((conf − 0.5)/(0.7 − 0.5), 0, 1)`; a val search confirmed the
+  continuous ramp edges a binary filter, and M2 is well-calibrated (ECE ≈ 0.02).
+
+### 10.3 Leak-safe validation — does the edge survive regime drift?
+- **Expanding-window walk-forward** (the honest test given the feature drift flagged by PSI):
+  train M2 on each window's past (threshold tuned on a recent tail), test on its future,
+  6 folds × 5 seeds. **M2 improves per-trade expectancy in 6/6 folds (+0.60% → +1.29%)** — the
+  benefit is drift-robust, not a single-window fluke.
+- **Hyper-parameter search** (min_samples_leaf × learning_rate × depth × l2) was **flat** — the
+  default config is near-optimal; the leverage is **retraining cadence**, not hyperparameters.
+- **Retraining mandate:** the most-recent walk-forward fold shows *both* M1 and M2 edges decaying
+  as the regime drifts away from training — the model has a shelf life and must be retrained on a
+  schedule. M2 is paired to a specific M1 checkpoint and is regenerated whenever M1 is retrained.
+
+### 10.4 Extended diagnostics (A–E, printed every training run)
+Five risk/calibration metrics in `crypto_metrics.py`, on the BTC test set:
+**(A)** Brier + Expected Calibration Error of P(long); **(B)** per-class barrier-implied profit
+factor / expectancy (Long vs Short); **(C)** signal autocorrelation (clustering — trades are *not*
+independent, lag-1 ≈ +0.43 → correlated exposure); **(D)** Population Stability Index (per-feature
+train→test drift — flags major shift in the daily-volatility features, quantifying the regime
+shift M2 is built for); **(E)** Maximum Adverse Excursion (worst intra-trade move before the barrier).
+
+---
+
+## 11. Techniques Checklist (for quick reference)
 
 **Architecture:** Temporal Transformer · Squeeze-and-Excitation · patch tokenisation /
 **temporal conv-stem** (production) · **learnable asset embedding** · RoPE · ALiBi ·
@@ -331,6 +377,11 @@ barriers · **multi-asset pooling (BTC/ETH/SOL)** · **cross-asset leave-one-out
 **PCA absorption ratio** · **anchored VWAP** · **permutation (path) entropy** · ATR / Wilder
 EMA · order-flow imbalance · VPIN · Amihud illiquidity · realised bipower variation (jump
 detection) · Ichimoku · multi-timeframe fusion via merge-asof · scale-invariant feature design.
+
+**Risk & sizing:** **meta-labeling** (frozen M1 direction / secondary M2 sizing) ·
+**confidence-scaled position sizing** · **GBM + RandomForest ensemble** · **expanding-window
+walk-forward validation** · **PSI feature-drift monitoring** · calibration (Brier / ECE) ·
+maximum adverse excursion · signal-clustering diagnostics.
 
 **Validation / serving:** chronological split · leakage-safe windowing · RobustScaler fit on
 train only · volatility-regime-adaptive thresholds · expected-PnL calibration ·

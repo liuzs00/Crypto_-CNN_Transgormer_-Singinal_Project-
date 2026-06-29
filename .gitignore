@@ -1,2 +1,9 @@
 __pycache__/
 *.pyc
+
+# secrets — NEVER commit your Telegram bot token / chat id
+telegram_config.json
+
+# local run logs / generated signal outputs
+predict_cron.log
+latest_signal.txt

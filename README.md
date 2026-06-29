@@ -183,7 +183,34 @@ drawdown (the robust measures) are what the conv-stem A/B improved.
 
 ---
 
-## 9. Code Architecture & Interpretability
+## 9. Meta-Labeling — Confidence-Scaled Position Sizing
+
+A second model decides *how much* to trade, separating **direction** from **sizing** (the
+López de Prado meta-labeling pattern):
+
+- **M1** — the frozen conv-stem transformer above — decides **direction**.
+- **M2** — a **GBM + RandomForest ensemble** — scores whether each M1 signal will be
+  **profitable** and emits a **confidence** + a continuous **recommended size** (0 = skip →
+  1 = full position), scaling exposure by conviction and suppressing weak signals in
+  unfavourable regimes.
+
+M2 reads M1's conviction plus a curated regime/volatility context (ATR, realised vol, PCA
+absorption, relative vol, ~11-day macro-vol) — it *judges the regime*, it doesn't relearn M1's
+call. Training and serving share one `m2_features()`, so they can't drift.
+
+**Validated the honest way — expanding-window walk-forward** (the only test that answers "does
+the edge survive regime drift?"): train M2 on each window's past, test on its future,
+6 folds × 5 seeds. **M2 lifts per-trade expectancy in 6 / 6 folds (+0.60% → +1.29%).** A
+hyper-parameter search confirmed the default near-optimal and M2 well-calibrated (ECE ≈ 0.02);
+the remaining lever is **retraining cadence** — the most-recent fold shows the edge decaying as
+the market drifts from the training regime, so the model is retrained on a schedule.
+
+Live signals therefore carry not just a direction but a size, e.g.
+`LONG · P=0.81 · M2conf=0.67 · size 0.83×`.
+
+---
+
+## 10. Code Architecture & Interpretability
 
 The production line is **modular**, with one source of truth each for features, model and
 metrics — so the trainer, backtest and predict scripts cannot drift out of train/serve parity
@@ -192,9 +219,13 @@ metrics — so the trainer, backtest and predict scripts cannot drift out of tra
 ```
 crypto_features.py   feature pipeline + config        ← imported by train / backtest / predict
 crypto_model.py      ConvStem + Transformer (from_cfg) ← single model definition
-crypto_metrics.py    evaluate · regime gates · attention analysis
+crypto_metrics.py    evaluate · regime gates · attention analysis · extended metrics (A–E)
+btc_meta_label.py    M2 trainer + serving lib (shared m2_features → no train/serve drift)
 ```
 
+- **Extended diagnostics (A–E)** in `crypto_metrics.py`, printed every training run: calibration
+  (Brier/ECE), per-class profit factor, signal autocorrelation, **PSI feature-drift**, and
+  maximum adverse excursion — surfacing calibration, regime drift, and intra-trade risk.
 - **Attention-map analysis** (in `crypto_metrics.py`): received-attention per patch, per-layer
   entropy, recency ratios, and Long-vs-Short / correct-vs-wrong profiles.
 - **Reproducible inference:** the checkpoint bundles weights + fitted scaler + ordered
@@ -206,57 +237,65 @@ crypto_metrics.py    evaluate · regime gates · attention analysis
 
 ---
 
-## 10. Repository Structure
+## 11. Repository Structure
 
 ```
 ├── crypto_data.py                 # Binance fetch/update (BTC/ETH/SOL): de-dup + continuity merge
 ├── crypto_features.py             # SHARED feature pipeline + config (282 features)
 ├── crypto_model.py                # SHARED model: temporal conv stem + RoPE/ALiBi transformer
-├── crypto_metrics.py              # SHARED evaluation + regime gates + attention analysis
-├── New_CNN_Transformer_Train.py   # Production trainer (BTC+ETH+SOL pooled) — thin orchestrator
+├── crypto_metrics.py              # SHARED evaluation + regime gates + attention + metrics A–E
+├── New_CNN_Transformer_Train.py   # Production M1 trainer (BTC+ETH+SOL pooled) — thin orchestrator
 ├── Baseline_Transformer_Train.py  # Single-asset baseline trainer (frozen reference)
 ├── btc_backtest_cross_nf.py       # Backtest the production model (triple-barrier trade sim)
-├── btc_predict_cross_nf.py        # Live signal: auto-fills the data gap, then predicts
+├── btc_predict_cross_nf.py        # Live signal: auto-fills the data gap → M1 dir + M2 size
+├── btc_meta_label.py              # M2 meta-label (GBM+RF ensemble): confidence + sizing
+├── walk_forward_m2.py             # M2 drift validation (expanding-window walk-forward)
+├── m2_hp_search.py                # M2 HP / calibration / sizing-curve search
 ├── btc_threshold_tuning.py        # 3-stage regime/threshold calibration
-├── FEATURES.md                    # Full 282-feature dictionary
-├── TECHNICAL_REPORT.md            # Architecture + feature-construction deep dive
+├── FEATURES.md  ·  TECHNICAL_REPORT.md          # Feature dictionary · architecture deep-dive
 ├── DATA/                          # Multi-asset, multi-timeframe OHLCV (2018 → present, UTC)
-└── btc_eth_sol_pooled_model_emb_cross_nf.pth   # Production checkpoint
+├── btc_eth_sol_pooled_model_emb_cross_nf.pth    # Production M1 checkpoint
+└── btc_eth_sol_meta_m2.pkl                       # Production M2 ensemble
 ```
 
 ---
 
-## 11. Usage
+## 12. Usage
 
 ```bash
 # 1. Refresh data (merge latest Binance candles into the historical CSVs; de-dup + continuity)
 python crypto_data.py                      # update all assets / timeframes
 
-# 2. Train the production model (defaults to the production config: 282 feat + conv stem)
-python New_CNN_Transformer_Train.py
+# 2. Train the production M1 (defaults to the production config: 282 feat + conv stem)
 python New_CNN_Transformer_Train.py        # ablations via env: NEWFEAT=0, CONVSTEM=0, SEED=0 …
 
-# 3. Live signals (auto-fills the data gap from the last candle, then scores)
+# 3. Train + save the M2 meta-label (after any M1 retrain — M2 is paired to the M1 checkpoint)
+python btc_meta_label.py                   # 5-seed validation, then saves btc_eth_sol_meta_m2.pkl
+
+# 4. Live signals (auto-fills the data gap, then scores — direction + M2 confidence + size)
 python btc_predict_cross_nf.py             # last 24 h (default)
-python btc_predict_cross_nf.py --days 7    # last 7 days
-python btc_predict_cross_nf.py --from 2026-06-01 --to 2026-06-10
+python btc_predict_cross_nf.py --days 7    # last 7 days, or --from/--to a date range
 python btc_predict_cross_nf.py --no-update # skip the data refresh
 
-# 4. Backtest the production model
+# 5. Backtest the production model · validate M2 drift-robustness
 python btc_backtest_cross_nf.py            # BTC test split (default)
+python walk_forward_m2.py                  # M2 expanding-window walk-forward
 ```
 
-Output: `btc_predict_cross_nf_signals.csv` — `timestamp, close, prob_long, vol_regime, signal`.
+Output: `btc_predict_cross_nf_signals.csv` —
+`timestamp, close, prob_long, vol_regime, signal, m2_confidence, recommended_size`.
 
 ---
 
-## 12. Tech Stack
+## 13. Tech Stack
 
 `PyTorch` · `NumPy` / `pandas` · `scikit-learn` · `matplotlib` · Binance REST API
 
 **Concepts demonstrated:** temporal-CNN + Transformer design (conv tokenizer, RoPE, ALiBi, SE,
 asset embedding) · multi-asset pooled training without leakage · triple-barrier labelling ·
 market microstructure (OFI, VPIN, Amihud) · cross-asset / PCA-absorption / permutation-entropy
-features · focal loss & class imbalance · volatility-regime calibration · **seed-controlled A/B
-experimentation** · multi-seed backtest validation · modular train/serve-parity architecture ·
-model interpretability.
+features · focal loss & class imbalance · volatility-regime calibration · **meta-labeling
+(direction/sizing split) with a GBM+RandomForest ensemble** · **confidence-scaled position
+sizing** · **expanding-window walk-forward validation** · **PSI feature-drift monitoring &
+calibration (ECE)** · **seed-controlled A/B experimentation** · multi-seed backtest validation ·
+modular train/serve-parity architecture · model interpretability.

@@ -2,10 +2,10 @@
 
 A research-grade deep-learning pipeline that forecasts directional trading signals for
 **BTC** over a 4-hour horizon, trained on a **pooled BTC + ETH + SOL** universe. The system
-fuses **four timeframes** (15m / 1h / 4h / 1d), engineers **282 scale-invariant features**
-(market-microstructure, cross-asset, systemic-risk and information-theoretic), and trains a
-**temporal-CNN → Transformer** (a conv tokenizer feeding RoPE + ALiBi attention) under a
-**triple-barrier labelling scheme** from quantitative finance.
+fuses **four timeframes** (15m / 1h / 4h / 1d), engineers **291 scale-invariant features**
+(market-microstructure, cross-asset, **index-futures macro-regime**, systemic-risk and
+information-theoretic), and trains a **temporal-CNN → Transformer** (a conv tokenizer feeding
+RoPE + ALiBi attention) under a **triple-barrier labelling scheme** from quantitative finance.
 
 > The goal is not "predict the price" — it is to frame trading as a **probabilistic,
 > risk-aware classification problem** and to engineer the full stack end-to-end:
@@ -39,7 +39,7 @@ identical at train and inference time — a subtle leakage trap that this pipeli
 ## 2. Architecture — Temporal CNN → Transformer
 
 ```
-   BTC + ETH + SOL  ·  4 timeframes (15m/1h/4h/1d)  →  282 features
+   BTC + ETH + SOL  ·  4 timeframes (15m/1h/4h/1d)  +  NQ/ES/gold macro  →  291 features
    aligned to the 4h grid via backward merge-asof
                          │  sequence of 64 candles (≈11 days)
                          ▼
@@ -72,11 +72,11 @@ identical at train and inference time — a subtle leakage trap that this pipeli
 
 ---
 
-## 3. Feature Engineering (282 features)
+## 3. Feature Engineering (291 features)
 
 All features are **scale-invariant** (ratios, returns, z-scores, ATR-normalised) and strictly
 **causal**, so the model generalises across BTC's 10×+ price range and pools cleanly across
-assets. Full dictionary in [FEATURES.md](FEATURES.md).
+assets. Full dictionary in [docs/FEATURES.md](docs/FEATURES.md).
 
 **Per-timeframe** (×4 timeframes)
 - **Microstructure / order flow:** taker buy-pressure, signed **Order-Flow Imbalance (OFI)**,
@@ -94,6 +94,17 @@ assets. Full dictionary in [FEATURES.md](FEATURES.md).
 - Relative return/vol/RSI, β and correlation to the universe, cross-sectional rank.
 - **Absorption Ratio** — variance share of the 1st principal component of the BTC/ETH/SOL
   return covariance (rolling PCA): a systemic-fragility / "assets in lockstep" signal.
+
+**Macro-regime** (the risk-on/off environment BTC couples to — 9 features)
+- **Index futures (Nasdaq-100 / S&P-500) + gold**, daily, forward-filled onto the 4h grid:
+  rolling **BTC↔NQ β / correlation**, **BTC↔gold β**, and their interaction
+  `mac_regime = β_NQ − β_gold` (trading as leveraged Nasdaq vs decoupled from gold), plus NQ
+  volatility / momentum and the **NQ−ES growth-rotation spread**.
+- **Strictly causal & 23/5-aware:** the daily macro bar for date *D* is only exposed from *D+1*,
+  betas are computed on macro *trading days* (weekdays) and frozen over weekends, with a
+  continuous **staleness counter** + **market-closed** flag so the model knows the macro leg is
+  stale. The only feature family sourced outside Binance (index futures via yfinance; gold via
+  Binance's PAXG token) — a genuinely **orthogonal** information source (BTC↔NQ corr ≈ 0.30).
 
 ---
 
@@ -155,11 +166,19 @@ return (compounded, path-dependent).
 |---|---|---|
 | Path entropy | feature | **adopted** — +1.3pp active acc, 3/3 seeds |
 | Temporal conv stem | architecture | **adopted** — +2.66pp acc 3/3; PF 5/5, Calmar +60% in backtest |
+| **NQ/ES + gold macro-regime** | data + feature | **adopted** — accuracy up 7/10 seeds (+0.51pp) **and drawdown better 6/10** (the only candidate to improve drawdown); a new orthogonal data scope |
 | Wavelet (DWT) coeffs · Hawkes self-excitation · fractional differencing · gated attention pooling | — | **rejected** — did not replicate across seeds |
+| Gold ratios/β · Rényi transfer-entropy · Lévy-area path signature | feature | **rejected** — cross-asset info saturated; accuracy gains didn't convert to PF/drawdown |
+| Vol-scaled ATR barriers · seq_len 64→84 | label / lookback | **rejected** — 5/5 worse (tiny calm-regime barriers resolve on noise) / wash |
+| Perp funding-rate + basis | feature | **rejected** — 10-seed A/B: acc 5/10 −0.33pp, PF flat, drawdown coin-flip (fast positioning signal, overlaps order-flow + mismatches the 16h horizon) |
 
-The recurring lesson: **data (multi-asset) and orthogonal features move the needle; heavy
-architecture changes do not — except a minimal tokenizer upgrade that preserves the working
-transformer.** Rejecting four plausible ideas is as much the point as adopting two.
+The recurring lesson: **a new orthogonal *data scope* is the highest-EV lever (multi-asset
+pooling, then the index-futures macro-regime); incremental single-feature and knob-tweak ideas
+are saturated, and heavy architecture changes don't help — except a minimal tokenizer upgrade
+that preserves the working transformer.** The refined nuance from the macro-vs-funding split:
+new data wins as a *slow regime reframe*, not a *fast positioning signal* that overlaps the
+existing order-flow features. Rejecting a dozen plausible ideas is as much the point as adopting
+three.
 
 ---
 
@@ -168,8 +187,8 @@ transformer.** Rejecting four plausible ideas is as much the point as adopting t
 | Metric | Value |
 |---|---|
 | Directional accuracy (argmax) | **~0.70** |
-| Confidence-filtered (active-signal) accuracy | **~0.74** |
-| Backtest profit factor (per-signal) | **~1.95** |
+| Confidence-filtered (active-signal) accuracy | **~0.75** |
+| Backtest profit factor (per-signal) | **~2.0** |
 | Backtest max drawdown | **~ −24%** |
 
 In a research backtest (test split, **0.05% fee/side, no slippage/funding, single window,
@@ -239,23 +258,38 @@ btc_meta_label.py    M2 trainer + serving lib (shared m2_features → no train/s
 
 ## 11. Repository Structure
 
+Every path resolves from `src/paths.py` (project root derived from `__file__`), so there are **no
+hardcoded machine paths** — clone the repo anywhere and it runs.
+
 ```
-├── crypto_data.py                 # Binance fetch/update (BTC/ETH/SOL): de-dup + continuity merge
-├── crypto_features.py             # SHARED feature pipeline + config (282 features)
-├── crypto_model.py                # SHARED model: temporal conv stem + RoPE/ALiBi transformer
-├── crypto_metrics.py              # SHARED evaluation + regime gates + attention + metrics A–E
-├── New_CNN_Transformer_Train.py   # Production M1 trainer (BTC+ETH+SOL pooled) — thin orchestrator
-├── Baseline_Transformer_Train.py  # Single-asset baseline trainer (frozen reference)
-├── btc_backtest_cross_nf.py       # Backtest the production model (triple-barrier trade sim)
-├── btc_predict_cross_nf.py        # Live signal: auto-fills the data gap → M1 dir + M2 size
-├── btc_meta_label.py              # M2 meta-label (GBM+RF ensemble): confidence + sizing
-├── walk_forward_m2.py             # M2 drift validation (expanding-window walk-forward)
-├── m2_hp_search.py                # M2 HP / calibration / sizing-curve search
-├── btc_threshold_tuning.py        # 3-stage regime/threshold calibration
-├── FEATURES.md  ·  TECHNICAL_REPORT.md          # Feature dictionary · architecture deep-dive
-├── DATA/                          # Multi-asset, multi-timeframe OHLCV (2018 → present, UTC)
-├── btc_eth_sol_pooled_model_emb_cross_nf.pth    # Production M1 checkpoint
-└── btc_eth_sol_meta_m2.pkl                       # Production M2 ensemble
+├── src/                           # PRODUCTION pipeline
+│   ├── paths.py                   #   single source of truth for every path (portable root)
+│   ├── crypto_data.py             #   Binance fetch/update (BTC/ETH/SOL + gold PAXG): de-dup + continuity
+│   ├── macro_data.py              #   Index-futures macro source (NQ/ES daily, yfinance)
+│   ├── funding_data.py            #   Perp funding/basis fetch (rejected experiment; FUNDING=0)
+│   ├── crypto_features.py         #   SHARED feature pipeline + config (291 features)
+│   ├── crypto_model.py            #   SHARED model: temporal conv stem + RoPE/ALiBi transformer
+│   ├── crypto_metrics.py          #   SHARED evaluation + regime gates + attention + metrics A–E
+│   ├── New_CNN_Transformer_Train.py #  Production M1 trainer (BTC+ETH+SOL pooled)
+│   ├── btc_backtest_cross_nf.py   #   Backtest the production model (triple-barrier trade sim)
+│   ├── btc_predict_cross_nf.py    #   Live signal: auto-fills data gap → M1 dir + M2 size
+│   ├── btc_meta_label.py          #   M2 meta-label (GBM+RF ensemble): confidence + sizing
+│   └── notify_telegram.py         #   Push the latest signal to Telegram
+├── experiments/                   # RESEARCH (not production) — _bootstrap.py puts src/ on sys.path
+│   ├── walk_forward_m2.py         #   M2 drift validation (expanding-window walk-forward)
+│   ├── m2_hp_search.py            #   M2 HP / calibration / sizing-curve search
+│   ├── btc_threshold_tuning.py    #   3-stage regime/threshold calibration
+│   └── Baseline_Transformer_Train.py  # Single-asset baseline (frozen reference)
+├── DATA/                          # Multi-asset, multi-timeframe OHLCV + macro + funding (UTC)
+├── models/                        # Trained checkpoints
+│   ├── btc_eth_sol_pooled_model_emb_cross_nf.pth   # Production M1 (291 feat)
+│   └── btc_eth_sol_meta_m2.pkl                     # Production M2 ensemble
+├── outputs/                       # Signals, trades, equity/attention plots
+├── logs/                          # predict_cron.log + btc_signal_state_log.csv (append-only history)
+├── scripts/                       # run_predict.bat + register_predict_task.ps1 (4h scheduled task)
+├── config/                        # telegram_config.json (gitignored) + .example
+├── tests/
+└── docs/                          # FEATURES.md · TECHNICAL_REPORT.md
 ```
 
 ---
@@ -263,38 +297,48 @@ btc_meta_label.py    M2 trainer + serving lib (shared m2_features → no train/s
 ## 12. Usage
 
 ```bash
-# 1. Refresh data (merge latest Binance candles into the historical CSVs; de-dup + continuity)
-python crypto_data.py                      # update all assets / timeframes
+# run from the project root — Python puts src/ on the path automatically
 
-# 2. Train the production M1 (defaults to the production config: 282 feat + conv stem)
-python New_CNN_Transformer_Train.py        # ablations via env: NEWFEAT=0, CONVSTEM=0, SEED=0 …
+# 1. Refresh data (merge latest Binance candles into the historical CSVs; de-dup + continuity)
+python src/crypto_data.py                      # BTC/ETH/SOL + gold (PAXG), all timeframes
+python src/macro_data.py --daily-only          # NQ/ES index-futures daily (macro-regime source; yfinance)
+
+# 2. Train the production M1 (defaults to the production config: 291 feat + macro + conv stem)
+python src/New_CNN_Transformer_Train.py        # ablations via env: NEWFEAT=0, MACRO=0, CONVSTEM=0, SEED=0 …
 
 # 3. Train + save the M2 meta-label (after any M1 retrain — M2 is paired to the M1 checkpoint)
-python btc_meta_label.py                   # 5-seed validation, then saves btc_eth_sol_meta_m2.pkl
+python src/btc_meta_label.py                   # 5-seed validation, then saves models/btc_eth_sol_meta_m2.pkl
 
 # 4. Live signals (auto-fills the data gap, then scores — direction + M2 confidence + size)
-python btc_predict_cross_nf.py             # last 24 h (default)
-python btc_predict_cross_nf.py --days 7    # last 7 days, or --from/--to a date range
-python btc_predict_cross_nf.py --no-update # skip the data refresh
+python src/btc_predict_cross_nf.py             # last 24 h (default)
+python src/btc_predict_cross_nf.py --days 7    # last 7 days, or --from/--to a date range
+python src/btc_predict_cross_nf.py --no-update # skip the data refresh
 
 # 5. Backtest the production model · validate M2 drift-robustness
-python btc_backtest_cross_nf.py            # BTC test split (default)
-python walk_forward_m2.py                  # M2 expanding-window walk-forward
+python src/btc_backtest_cross_nf.py            # BTC test split (default)
+python experiments/walk_forward_m2.py          # M2 expanding-window walk-forward
 ```
 
-Output: `btc_predict_cross_nf_signals.csv` —
-`timestamp, close, prob_long, vol_regime, signal, m2_confidence, recommended_size`.
+Outputs:
+- `outputs/btc_predict_cross_nf_signals.csv` — the requested window (overwritten each run):
+  `timestamp, close, prob_long, vol_regime, signal, m2_confidence, recommended_size`
+- `logs/btc_signal_state_log.csv` — **append-only** signal-state history: each run adds only the
+  new bar(s) and never rewrites stored signals (live track record).
+
+The 4h scheduled task (`scripts/register_predict_task.ps1` → `scripts/run_predict.bat`) runs the
+predict + Telegram push automatically at 00:05/04:05/…/20:05 **UTC**.
 
 ---
 
 ## 13. Tech Stack
 
-`PyTorch` · `NumPy` / `pandas` · `scikit-learn` · `matplotlib` · Binance REST API
+`PyTorch` · `NumPy` / `pandas` · `scikit-learn` · `matplotlib` · Binance REST API · `yfinance` (index-futures macro)
 
 **Concepts demonstrated:** temporal-CNN + Transformer design (conv tokenizer, RoPE, ALiBi, SE,
 asset embedding) · multi-asset pooled training without leakage · triple-barrier labelling ·
-market microstructure (OFI, VPIN, Amihud) · cross-asset / PCA-absorption / permutation-entropy
-features · focal loss & class imbalance · volatility-regime calibration · **meta-labeling
+market microstructure (OFI, VPIN, Amihud) · cross-asset / PCA-absorption / permutation-entropy /
+**index-futures macro-regime** features · causal daily→4h forward-fill (23/5-aware) · focal loss
+& class imbalance · volatility-regime calibration · **meta-labeling
 (direction/sizing split) with a GBM+RandomForest ensemble** · **confidence-scaled position
 sizing** · **expanding-window walk-forward validation** · **PSI feature-drift monitoring &
 calibration (ECE)** · **seed-controlled A/B experimentation** · multi-seed backtest validation ·

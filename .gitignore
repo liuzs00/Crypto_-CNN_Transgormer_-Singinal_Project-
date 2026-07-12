@@ -4,6 +4,7 @@ __pycache__/
 # secrets — NEVER commit your Telegram bot token / chat id
 telegram_config.json
 
-# local run logs / generated signal outputs
+# local run logs / generated signal outputs (runtime state — grows on every 4h run)
 predict_cron.log
 latest_signal.txt
+logs/btc_signal_state_log.csv
